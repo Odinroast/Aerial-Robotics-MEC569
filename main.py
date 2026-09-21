@@ -34,7 +34,7 @@ if __name__ == '__main__':
     lg_stab.add_variable('stabilizer.roll', 'float')
     lg_stab.add_variable('stabilizer.pitch', 'float')
     lg_stab.add_variable('stabilizer.yaw', 'float')
-    lg_stab.add_variable('range.zrange', 'float')
+    lg_stab.add_variable('range.up', 'float')
 
 
     with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
