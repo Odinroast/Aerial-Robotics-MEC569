@@ -55,6 +55,7 @@ if __name__ == '__main__':
     lg_stab.add_variable('range.left', 'float')
     lg_stab.add_variable('range.right', 'float')
     lg_stab.add_variable('range.zrange', 'float')
+    lg_stab.add_variable('range.up', 'float')
     
     cf = Crazyflie(rw_cache='./cache')
     with SyncCrazyflie(URI, cf=cf) as scf:
