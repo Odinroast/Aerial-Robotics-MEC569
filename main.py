@@ -138,7 +138,7 @@ if __name__ == '__main__':
 
     # Write accumulated metrics to a CSV file after landing
     filename = "flight_log.csv"
-    headers = ["timestamp", "front", "back", "left", "right", "up", "zrange"]
+    headers = ["timestamp (us)", "front", "back", "left", "right", "up", "zrange"]
     
     with open(filename, mode="w", newline="") as f:
         writer = csv.writer(f)

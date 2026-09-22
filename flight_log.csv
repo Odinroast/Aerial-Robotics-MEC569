@@ -1,4 +1,4 @@
-timestamp,front,back,left,right,up,zrange
+timestamp (us),front,back,left,right,up,zrange
 60446,32.766,32.766,1.431,0.126,2.348,0.016
 60456,32.766,32.766,1.431,0.126,2.348,0.016
 60466,32.766,32.766,1.431,0.126,2.364,0.016
