@@ -2,3 +2,5 @@ cflib
 pandas
 matplotlib
 ipympl
+plotly
+nbformat
