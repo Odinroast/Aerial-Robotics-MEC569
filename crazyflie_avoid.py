@@ -201,12 +201,19 @@ def fly_to_goal(scf, tracker):
         gx, gy = x0 + GOAL_X, y0 + GOAL_Y
         t0 = time.time()
 
+        last_mr_down = mr.down
+        box_detected = False
         while True:
             if ceiling_close(mr):
                 print('Obstacle above - landing.')
                 break
             if time.time() - t0 > MAX_FLIGHT_TIME:
                 print('Time limit reached - landing.')
+                break
+
+            if last_mr_down - mr.down > 0.3: #Lowkey forgot what units lol
+                print('Box detected below - locating.')
+                box_detected = True
                 break
 
             x, y, _ = tracker.position
@@ -219,7 +226,17 @@ def fly_to_goal(scf, tracker):
             vy_des = _clip(K_ATTRACT * ey, V_MAX)
             vx, vy = avoidance_velocity(mr, vx_des, vy_des)
             mc.start_linear_motion(vx, vy, 0.0)
+            last_mr_down = mr.down
             time.sleep(LOOP_DT)
+
+        if box_detected: # Simple option
+            print('Box detected below - landing.')
+            mc.forward(0.2)
+            while True:
+                mc.start_linear_motion(0.5, 0.0, 0.0) # I believe X is to the right
+                if mr.down - last_mr_down  < 0.3:
+                    mc.left(0.2)
+                    break
 
         mc.stop()
         time.sleep(0.5)

@@ -33,6 +33,17 @@ def take_off_simple(scf):
     with MotionCommander(scf, default_height=DEFAULT_HEIGHT) as mc:
         time.sleep(3)
 
+def hover_until_interrupted(scf):
+    with MotionCommander(scf, default_height=DEFAULT_HEIGHT) as mc:
+        print('Flying... press Ctrl+C to land')
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print('Landing...')
+        # Exiting the "with" block here calls mc.land() automatically
+
+
 # Simple move forward and back function
 def move_linear_simple(scf):
     with MotionCommander(scf, default_height=DEFAULT_HEIGHT) as mc:
@@ -58,4 +69,4 @@ if __name__ == '__main__':
         # Arm drone
         scf.cf.supervisor.send_arming_request(True)
         time.sleep(1.0)
-        take_off_simple(scf)
+        hover_until_interrupted(scf)
