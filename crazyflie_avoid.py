@@ -47,11 +47,14 @@ SAFE_DIST = 0.50           # start reacting at this range [m]
 STOP_DIST = 0.25           # never move toward an obstacle closer than this [m]
 K_REPEL = 0.6              # repulsion speed at STOP_DIST [m/s]
 CEILING_DIST = 0.20        # land if something is this close above [m]
+BOX_EDGE_THRESH = 0.1     # box edge detection threshold [m]
+BOX_CENTER_OFFSET = 0.20   # distance to back off after leaving the box [m]
+BOX_ALIGN_SPEED = 0.12     # box-centering search speed [m/s]
 
 logging.basicConfig(level=logging.ERROR)
 
 # ----------------------------------------------------------------------------
-# Deck detection
+# Deck detection 
 flow_event = Event()
 ranger_event = Event()
 
@@ -192,6 +195,48 @@ def ceiling_close(mr):
     return mr.up is not None and mr.up < CEILING_DIST
 
 
+def move_to_box_center(mc, mr):
+    """
+    Fixed-box strategy:
+      1) detect a downward edge as the drone starts to pass over the box
+      2) keep moving until the sensor rises again (the box edge is left)
+      3) stop and reverse by a fixed known distance to center over the box
+    """
+
+    prev_d = mr.down if mr.down is not None else DEFAULT_HEIGHT
+    entered_box = False
+    t0 = time.time()
+
+    while True:
+        curr_d = mr.down if mr.down is not None else prev_d
+    
+        # First edge: a drop in the measured down-range distance means the drone
+        # has entered the box.
+        if curr_d - prev_d > BOX_EDGE_THRESH:
+            mc.backward(0.15)  # back up a bit to avoid the edge
+            break
+
+        prev_d = curr_d
+        mc.start_linear_motion(0.5, 0.0, 0.0)
+        time.sleep(LOOP_DT)
+
+    while True:
+        curr_d = mr.down if mr.down is not None else prev_d
+
+        # First edge: a drop in the measured down-range distance means the drone
+        # has entered the box.
+        if curr_d - prev_d > BOX_EDGE_THRESH:
+            mc.left(0.15)  # back up a bit to avoid the edge
+            break
+
+        prev_d = curr_d
+        mc.start_linear_motion(0.0, -0.5, 0.0)
+        time.sleep(LOOP_DT)
+
+    mc.stop()
+    time.sleep(0.3)
+
+
 # ----------------------------------------------------------------------------
 # Flight modes
 def fly_to_goal(scf, tracker):
@@ -201,7 +246,7 @@ def fly_to_goal(scf, tracker):
         gx, gy = x0 + GOAL_X, y0 + GOAL_Y
         t0 = time.time()
 
-        last_mr_down = mr.down
+        last_mr_down = mr.down if mr.down is not None else DEFAULT_HEIGHT
         box_detected = False
         while True:
             if ceiling_close(mr):
@@ -211,7 +256,8 @@ def fly_to_goal(scf, tracker):
                 print('Time limit reached - landing.')
                 break
 
-            if last_mr_down - mr.down > 0.3: #Lowkey forgot what units lol
+            current_down = mr.down if mr.down is not None else last_mr_down
+            if last_mr_down - current_down > BOX_EDGE_THRESH:
                 print('Box detected below - locating.')
                 box_detected = True
                 break
@@ -226,17 +272,17 @@ def fly_to_goal(scf, tracker):
             vy_des = _clip(K_ATTRACT * ey, V_MAX)
             vx, vy = avoidance_velocity(mr, vx_des, vy_des)
             mc.start_linear_motion(vx, vy, 0.0)
-            last_mr_down = mr.down
+            last_mr_down = current_down
             time.sleep(LOOP_DT)
 
-        if box_detected: # Simple option
+        if box_detected:
             print('Box detected below - landing.')
-            mc.forward(0.2)
-            while True:
-                mc.start_linear_motion(0.5, 0.0, 0.0) # I believe X is to the right
-                if mr.down - last_mr_down  < 0.3:
-                    mc.left(0.2)
-                    break
+
+            # Move forward until the box edge passes, then back off to center.
+            move_to_box_center(mc, mr, 0.0)
+
+            # Then repeat in the lateral direction to center the box width.
+            move_to_box_center(mc, mr, 0.0)
 
         mc.stop()
         time.sleep(0.5)
