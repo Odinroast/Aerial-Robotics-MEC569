@@ -302,7 +302,7 @@ def fly_to_goal(scf, tracker):
                 # has entered the box.
                 if curr_d - prev_d > BOX_EDGE_THRESH:
                     box_x2 = tracker.position[0]
-                    mc.back(box_x2 - box_x1) 
+                    mc.back(0.5*(box_x2 - box_x1)) 
                     break
         
                 prev_d = curr_d
@@ -316,7 +316,7 @@ def fly_to_goal(scf, tracker):
                 # has entered the box.
                 if curr_d - prev_d > BOX_EDGE_THRESH:
                     box_y2 = tracker.position[1]
-                    mc.left(box_y2 - box_y1)  
+                    mc.left(0.5*(box_y2 - box_y1))  
                     break
         
                 prev_d = curr_d
