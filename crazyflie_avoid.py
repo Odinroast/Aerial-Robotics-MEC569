@@ -246,6 +246,11 @@ def fly_to_goal(scf, tracker):
         gx, gy = x0 + GOAL_X, y0 + GOAL_Y
         t0 = time.time()
 
+        box_x1 = 0
+        box_x2 = 0
+        box_y1 = 0  
+        box_y2 = 0
+
         last_mr_down = mr.down if mr.down is not None else DEFAULT_HEIGHT
         box_detected = False
         while True:
@@ -278,11 +283,45 @@ def fly_to_goal(scf, tracker):
         if box_detected:
             print('Box detected below - landing.')
 
-            # Move forward until the box edge passes, then back off to center.
-            move_to_box_center(mc, mr, 0.0)
+            box_x1 = tracker.position[0]
+            box_y1 = tracker.position[1]
 
-            # Then repeat in the lateral direction to center the box width.
-            move_to_box_center(mc, mr, 0.0)
+            """
+            Fixed-box strategy:
+                1) detect a downward edge as the drone starts to pass over the box
+                2) keep moving until the sensor rises again (the box edge is left)
+                3) stop and reverse by a fixed known distance to center over the box
+            """
+        
+            prev_d = mr.down if mr.down is not None else DEFAULT_HEIGHT
+        
+            while True:
+                curr_d = mr.down if mr.down is not None else prev_d
+            
+                # First edge: a drop in the measured down-range distance means the drone
+                # has entered the box.
+                if curr_d - prev_d > BOX_EDGE_THRESH:
+                    box_x2 = tracker.position[0]
+                    mc.back(box_x2 - box_x1) 
+                    break
+        
+                prev_d = curr_d
+                mc.start_linear_motion(0.5, 0.0, 0.0)
+                time.sleep(LOOP_DT)
+        
+            while True:
+                curr_d = mr.down if mr.down is not None else prev_d
+        
+                # First edge: a drop in the measured down-range distance means the drone
+                # has entered the box.
+                if curr_d - prev_d > BOX_EDGE_THRESH:
+                    box_y2 = tracker.position[1]
+                    mc.left(box_y2 - box_y1)  
+                    break
+        
+                prev_d = curr_d
+                mc.start_linear_motion(0.0, -0.5, 0.0)
+                time.sleep(LOOP_DT)
 
         mc.stop()
         time.sleep(0.5)
