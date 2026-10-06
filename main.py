@@ -1,331 +1,267 @@
+"""Run: python3 main.py [radio URI]
+Offline replay: python3 main.py --replay old_flight_log.csv --output replay.csv
+Telemetry callback only copies data. One worker maps/plans; the main loop flies.
 """
-Main entry point for Crazyflie autonomous navigation and goal-area sweep.
-Uses a 10 Hz background global planner and 50 Hz reactive local controller from planner.py.
-"""
-import csv  
-import logging
-import sys
-import time
+import argparse
+import csv
 import math
 import queue
-from enum import Enum, auto
-from collections import deque
-from math import sin, cos, radians
-
-import cflib.crtp
-from cflib.crazyflie import Crazyflie
-from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
-from cflib.positioning.motion_commander import MotionCommander
-from cflib.utils.multiranger import Multiranger
-from cflib.utils import uri_helper
-from cflib.crazyflie.log import LogConfig
+import threading
+import time
+from collections import Counter
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
-from matplotlib.patches import Rectangle
+from slam import GlobalOccupancyGrid, GridSLAM, MAX_RANGE
+from planner import Navigator
 
-from slam import GlobalOccupancyGrid
-from planner import NavigationManager
-
-# --- Global Variables & Parameters ---
-log_data = deque(maxlen=100)
-csv_history = []
-map_len, map_width = (2, 2)
-goal_len = 0.25  # Length of goal spaces
-
-plot_queue = queue.Queue()
-URI = uri_helper.uri_from_env(default='radio://0/98/2M/E7E7E7E7E8')
-if len(sys.argv) > 1:
-    URI = sys.argv[1]
-
-logging.basicConfig(level=logging.ERROR)
-start_x, start_y = 0.3, 0.0  # Drone starts inside Start Area
-
-# Goal Region Definitions [x_min, x_max, y_min, y_max]
-START_GOAL_AREA = [0.0, goal_len, -map_width / 2, map_width / 2]
-TARGET_GOAL_AREA = [map_len - goal_len, map_len, -goal_len / 2, goal_len / 2]
-TARGET_CENTER = (map_len - (goal_len / 2), 0.0)
-
-# Thread-safe dictionary storing latest pose
-latest_pose = {'x': start_x, 'y': start_y, 'yaw': 0.0}
-
-class MissionState(Enum):
-    NAVIGATING = auto()
-    SWEEPING = auto()
-    FINISHED = auto()
-
-# --- Initialize Global Occupancy Grid Map ---
-global_map = GlobalOccupancyGrid(
-    map_x_min=0.0, 
-    map_x_max=map_len, 
-    map_y_min=-map_width / 2, 
-    map_y_max=map_width / 2, 
-    resolution=0.02
-)
-
-# --- Matplotlib Setup ---
-# --- Matplotlib Setup ---
-plt.ion()  
-fig, ax = plt.subplots(figsize=(8, 8))
-
-drone_path_line, = ax.plot([], [], 'ro-', label='Drone Path', markersize=4)
-lidar_scatter, = ax.plot([], [], 'bx', label='Lidar Hits', markersize=3)
-
-# Plot line for high-level global path dots
-path_dots_line, = ax.plot([], [], 'go--', label='Global Path Dots', markersize=5, linewidth=1.5)
-
-# Draw Start Area and Target Goal Area Rectangles
-start_box = Rectangle(
-    (START_GOAL_AREA[0], START_GOAL_AREA[2]),
-    START_GOAL_AREA[1] - START_GOAL_AREA[0],
-    START_GOAL_AREA[3] - START_GOAL_AREA[2],
-    linewidth=1.5, edgecolor='gray', facecolor='lightgray', alpha=0.3, label='Start Zone'
-)
-target_box = Rectangle(
-    (TARGET_GOAL_AREA[0], TARGET_GOAL_AREA[2]),
-    TARGET_GOAL_AREA[1] - TARGET_GOAL_AREA[0],
-    TARGET_GOAL_AREA[3] - TARGET_GOAL_AREA[2],
-    linewidth=1.5, edgecolor='green', facecolor='lightgreen', alpha=0.3, label='Target Goal Zone'
-)
-ax.add_patch(start_box)
-ax.add_patch(target_box)
-
-heading_arrow = FancyArrowPatch(
-    (0, 0), (0, 0),
-    color='red',
-    arrowstyle='->,head_width=4,head_length=8',
-    mutation_scale=10,
-    linewidth=2,
-    label='Heading'
-)
-ax.add_patch(heading_arrow)
-
-ax.set_xlim(0, map_len)
-ax.set_ylim(-map_width/2, map_width/2)
-ax.set_xlabel('X Position (m)')
-ax.set_ylabel('Y Position (m)')
-ax.set_title('Real-Time Hardware Mapping & Autonomous Planning')
-ax.grid(True)
-ax.legend(loc='upper right')
-
-drone_x_hist, drone_y_hist = [], []
-ARROW_LENGTH = 0.4 
-
-def process_plot_updates(current_dots=None):
-    updated = False
-    latest_x, latest_y, latest_yaw = None, None, None
-
-    # Empty queue to get latest drone pose
-    while not plot_queue.empty():
-        x, y, yaw = plot_queue.get_nowait()
-        drone_x_hist.append(x)
-        drone_y_hist.append(y)
-        latest_x, latest_y, latest_yaw = x, y, yaw
-        updated = True
-
-    # NEW: Update the visual global path line whenever dots exist
-    if current_dots:
-        dots_x = [pt[0] for pt in current_dots]
-        dots_y = [pt[1] for pt in current_dots]
-        path_dots_line.set_data(dots_x, dots_y)
-    else:
-        path_dots_line.set_data([], [])
-
-    if updated and latest_x is not None:
-        # Update drone path history
-        drone_path_line.set_data(drone_x_hist, drone_y_hist)
-        
-        # Extract obstacle coordinates from grid
-        obstacle_pts = global_map.get_occupied_points(threshold=1.0)
-        if len(obstacle_pts) > 0:
-            lidar_scatter.set_data(obstacle_pts[:, 0], obstacle_pts[:, 1])
-        else:
-            lidar_scatter.set_data([], [])
-
-        # Update heading arrow position
-        rad = radians(latest_yaw)
-        dx = ARROW_LENGTH * cos(rad)
-        dy = ARROW_LENGTH * sin(rad)
-        heading_arrow.set_positions((latest_x, latest_y), (latest_x + dx, latest_y + dy))
-        
-        fig.canvas.draw_idle()
-        fig.canvas.flush_events()
-
-def generate_concentric_sweep(area_bounds, step_margin=0.2):
-    """Generates sequential waypoints sweeping a rectangle from outside to inside."""
-    x_min, x_max, y_min, y_max = area_bounds
-    waypoints = []
-    
-    while (x_min < x_max) and (y_min < y_max):
-        waypoints.extend([
-            (x_min, y_min),
-            (x_max, y_min),
-            (x_max, y_max),
-            (x_min, y_max),
-            (x_min, y_min + step_margin)
-        ])
-        x_min += step_margin
-        x_max -= step_margin
-        y_min += step_margin
-        y_max -= step_margin
-        
-    return waypoints
+START = (.3, 0.)
+GOAL = (4.35, 0.)
+GOAL_AREA = (4.1, 4.6, -.25, .25)
+HEIGHT = .8
+TURN_EVERY_WAYPOINTS = 3  # Set to 3, 4, etc.; CLI --turn-every overrides this.
+DEFAULT_URI = 'radio://0/98/2M/E7E7E7E7E8'
+DIRECTIONS = ('front', 'back', 'left', 'right', 'up', 'zrange')
 
 
-def log_stab_callback(timestamp, data, logconf):
-    F_d = data['range.front'] / 1000
-    B_d = data['range.back'] / 1000
-    L_d = data['range.left'] / 1000
-    R_d = data['range.right'] / 1000
-    U_d = data['range.up'] / 1000
-    D_d = data['range.zrange'] / 1000
-    x = data['stateEstimate.x'] + start_x
-    y = data['stateEstimate.y'] + start_y
-    deg = data['stateEstimate.yaw']
+def meters(mm):
+    """Firmware range.* values are millimeters. Convert ONCE; keep unknown unknown."""
+    value = float(mm)/1000.
+    return value if math.isfinite(value) and 0. < value < MAX_RANGE else float('nan')
 
-    # Update local memory cache for planner thread
-    latest_pose['x'] = x
-    latest_pose['y'] = y
-    latest_pose['yaw'] = deg
 
-    parsed_data = [F_d, B_d, L_d, R_d, U_d, D_d, x, y, deg]
-    log_data.append(parsed_data)
-    csv_history.append([timestamp, F_d, B_d, L_d, R_d, U_d, D_d, x, y, deg])
+def save_rows(path, rows):
+    if rows:
+        with open(path, 'w', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
 
-    global_map.update_map(x, y, deg, ranges=(F_d, B_d, L_d, R_d))
-    plot_queue.put((x, y, deg))
 
-# Read raw ranger distances (meters)
-def to_meters(mm_val):
-    """Converts raw Multiranger readings (mm) to meters. Defaults to 1.0m if None or 0."""
-    if mm_val is None or mm_val == 0:
-        return 1.0  # Open space / out-of-range default
-    return mm_val / 1000.0
+def replay(path, output):
+    """Replay recorded odometry/ranges. This cannot validate true position accuracy."""
+    grid, rows, counts = GlobalOccupancyGrid(), [], Counter()
+    slam = GridSLAM(grid, START)
+    last = -float('inf')
+    with open(path, newline='') as file:
+        reader = csv.DictReader(line for line in file if not line.startswith('#'))
+        for row in reader:
+            stamp = float(row['timestamp (ms)'])/1000.
+            odom = {'x': float(row.get('raw_X') or row['X']),
+                    'y': float(row.get('raw_Y') or row['Y']), 'yaw': float(row.get('raw_Yaw') or row['Yaw'])}
+            slam.corrected_pose(odom)
+            if row.get('controller_state') == 'GROUND' or stamp-last < .049:
+                continue
+            # Old CSV range columns are already meters, not millimeters.
+            ranges = tuple(float(row[d]) if 0 < float(row[d]) < MAX_RANGE else float('nan')
+                           for d in DIRECTIONS[:4])
+            slam.update(stamp, odom, ranges)
+            pose, diag = slam.corrected_pose(odom), slam.diagnostics()
+            counts[diag['slam_state']] += 1
+            rows.append({'timestamp (ms)': row['timestamp (ms)'], 'raw_X': odom['x'],
+                         'raw_Y': odom['y'], 'raw_Yaw': odom['yaw'],
+                         'X': pose['x'], 'Y': pose['y'], 'Yaw': pose['yaw'], **diag})
+            last = stamp
+    save_rows(output, rows)
+    print('Replay SLAM states:', dict(counts))
+    print('Final map-to-odometry transform:', slam.diagnostics())
+    print('Saved', output)
+
+
+def fly(uri, output, turn_every=TURN_EVERY_WAYPOINTS, show_plot=True, plot_hz=5.):
+    # Import radio dependencies only for flight. Offline tests/replay need no cflib.
+    import cflib.crtp
+    from cflib.crazyflie import Crazyflie
+    from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+    from cflib.crazyflie.log import LogConfig
+    from cflib.positioning.motion_commander import MotionCommander
+
+    grid = GlobalOccupancyGrid()
+    slam, nav = GridSLAM(grid, START), Navigator(grid, GOAL, turn_every=turn_every)
+    samples, stop = queue.Queue(maxsize=1), threading.Event()
+    data_lock = threading.Lock()
+    latest, worker_state, history = {}, {'heartbeat': time.monotonic(), 'error': None}, []
+    live_state = {'command': (0., 0., 0.), 'phase': 'GROUND'}
+    plotter = None
+
+    def get_live_sample():
+        with data_lock:
+            sample = dict(latest)
+            if sample:
+                sample.update(live_state)
+            return sample
+
+    def callback(timestamp, data, _):
+        odom = {'x': data['stateEstimate.x'], 'y': data['stateEstimate.y'],
+                'yaw': data['stateEstimate.yaw']}
+        if not all(math.isfinite(v) for v in odom.values()):
+            return                         # Existing telemetry-age check will stop flight.
+        sample = {'timestamp': timestamp, 'received': time.monotonic(), 'odom': odom,
+                  'ranges': tuple(meters(data['range.'+d]) for d in DIRECTIONS),
+                  'raw_ranges': tuple(data['range.'+d] for d in DIRECTIONS)}
+        with data_lock:
+            latest.clear()
+            latest.update(sample)
+        # Overwrite old queued samples: never build a backlog behind live flight.
+        try:
+            samples.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            samples.put_nowait(sample)
+        except queue.Full:
+            pass
+
+    def worker():
+        last_timestamp = None
+        try:
+            while not stop.is_set():
+                try:
+                    sample = samples.get(timeout=.1)
+                except queue.Empty:
+                    continue
+                if sample['timestamp'] == last_timestamp:
+                    continue
+                last_timestamp = sample['timestamp']
+                slam.update(sample['received'], sample['odom'], sample['ranges'][:4])
+                pose = slam.corrected_pose(sample['odom'])
+                nav.update_route(pose)
+                with data_lock:
+                    worker_state['heartbeat'] = time.monotonic()
+        except Exception as error:
+            with data_lock:
+                worker_state['error'] = str(error)
+
+    cflib.crtp.init_drivers()
+    log = LogConfig(name='Navigation', period_in_ms=50)  # 20 Hz, synchronized telemetry.
+    for direction in DIRECTIONS:
+        log.add_variable('range.'+direction, 'uint16_t')
+    for axis in ('x', 'y', 'yaw'):
+        log.add_variable('stateEstimate.'+axis, 'float')
+    thread = None
+    try:
+        with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
+            scf.cf.log.add_config(log)
+            log.data_received_cb.add_callback(callback)
+            log.start()
+            deadline = time.monotonic()+5.
+            while not latest and time.monotonic() < deadline:
+                time.sleep(.05)
+            with data_lock:
+                initial = dict(latest)
+            if not initial:
+                raise RuntimeError('No telemetry received; flight not started')
+            slam.corrected_pose(initial['odom'])  # Anchor map at START while grounded.
+            if show_plot:
+                from plotter import LivePlotter
+                try:
+                    plotter = LivePlotter(grid, slam, nav, get_live_sample, START, GOAL, GOAL_AREA,
+                                          update_hz=plot_hz)
+                    plotter.start()
+                except Exception as error:
+                    print('Could not start dashboard; flight continues:', error)
+            with data_lock:
+                live_state['phase'] = 'TAKEOFF'
+            scf.cf.platform.send_arming_request(True)
+            time.sleep(1.)
+            try:
+                with MotionCommander(scf, default_height=HEIGHT) as motion:
+                    # Start mapping only after takeoff: ground readings do not enter the map.
+                    with data_lock:
+                        worker_state['heartbeat'] = time.monotonic()
+                        live_state['phase'] = 'NAVIGATING'
+                    thread = threading.Thread(target=worker, daemon=True)
+                    thread.start()
+                    mission_start = last_print = time.monotonic()
+                    print(f'Navigation started: radius 0.10 m, margin 0.04 m, turn every {turn_every} waypoints')
+                    try:
+                        while True:
+                            now = time.monotonic()
+                            with data_lock:
+                                sample, health = dict(latest), dict(worker_state)
+                            if now-sample['received'] > .5 or now-health['heartbeat'] > 2.:
+                                print('Telemetry or SLAM worker stale; landing')
+                                motion.stop()
+                                break
+                            if health['error']:
+                                print('Mapping/planning failed:', health['error'])
+                                motion.stop()
+                                break
+                            if now-mission_start > 180.:
+                                print('Mission time limit reached; landing')
+                                motion.stop()
+                                break
+                            pose = slam.corrected_pose(sample['odom'])
+                            ranges = sample['ranges']
+                            if math.isfinite(ranges[4]) and ranges[4] < .20:
+                                print('Up-sensor stop; landing')
+                                motion.stop()
+                                break
+                            x0, x1, y0, y1 = GOAL_AREA
+                            if x0 <= pose['x'] <= x1 and y0 <= pose['y'] <= y1:
+                                print('Entered goal area; landing')
+                                motion.stop()
+                                break
+                            vx, vy, yaw_rate = nav.command(pose, ranges[:4], now)
+                            if nav.fault:
+                                print(nav.fault+'; landing')
+                                motion.stop()
+                                break
+                            motion.start_linear_motion(vx, vy, 0., yaw_rate)
+                            with data_lock:
+                                live_state['command'] = (vx, vy, yaw_rate)
+                            diag = slam.diagnostics()
+                            with nav.lock:
+                                state, reason, target = nav.state, nav.reason, nav.target or (None, None)
+                                reached, revision, desired = nav.reached, nav.revision, nav.desired_yaw
+                            history.append({'timestamp (ms)': sample['timestamp'],
+                                            **dict(zip(DIRECTIONS, ranges)),
+                                            **dict(zip(('raw_'+d+'_mm' for d in DIRECTIONS), sample['raw_ranges'])),
+                                            'X': pose['x'], 'Y': pose['y'], 'Yaw': pose['yaw'],
+                                            'raw_X': sample['odom']['x'], 'raw_Y': sample['odom']['y'],
+                                            'raw_Yaw': sample['odom']['yaw'], 'controller_state': state,
+                                            'stop_reason': reason, 'cmd_vx': vx, 'cmd_vy': vy,
+                                            'cmd_yaw_rate': yaw_rate, 'target_X': target[0], 'target_Y': target[1],
+                                            'waypoints_reached': reached, 'plan_revision': revision,
+                                            'desired_yaw': desired, **diag})
+                            if now-last_print > 2.:
+                                print(f"{state}: XY=({pose['x']:.2f}, {pose['y']:.2f}), "
+                                      f"waypoints={reached}, SLAM={diag['slam_state']}, reason={reason}")
+                                last_print = now
+                            time.sleep(max(.001, .02-(time.monotonic()-now)))
+                    finally:
+                        with data_lock:
+                            live_state.update(command=(0., 0., 0.), phase='LANDING')
+            finally:
+                stop.set()
+                if thread:
+                    thread.join(timeout=3.)
+                log.stop()
+                with data_lock:
+                    live_state['phase'] = 'FINISHED'
+    finally:
+        if plotter is not None:
+            plotter.close()
+        save_rows(output, history)            # Save useful diagnostics even after an error.
+        np.savez_compressed('occupancy_map.npz', grid=grid.grid, resolution=grid.resolution,
+                            bounds=[grid.x_min, grid.x_max, grid.y_min, grid.y_max])
+        print('Saved '+output+' and occupancy_map.npz' if history else 'No flight rows; saved occupancy_map.npz')
+
 
 if __name__ == '__main__':
-    cflib.crtp.init_drivers(enable_debug_driver=False)
-
-    log_config = LogConfig(name='LogData', period_in_ms=10)
-    log_config.add_variable('range.front', 'FP16')
-    log_config.add_variable('range.back', 'FP16')
-    log_config.add_variable('range.left', 'FP16')
-    log_config.add_variable('range.right', 'FP16')
-    log_config.add_variable('range.zrange', 'FP16')
-    log_config.add_variable('range.up', 'FP16')
-    log_config.add_variable('stateEstimate.x', 'FP16')
-    log_config.add_variable('stateEstimate.y', 'FP16')
-    log_config.add_variable('stateEstimate.yaw', 'FP16')
-    
-    cf = Crazyflie(rw_cache='./cache')
-    with SyncCrazyflie(URI, cf=cf) as scf:
-        cf = scf.cf
-        cf.log.add_config(log_config)
-        log_config.data_received_cb.add_callback(log_stab_callback)
-        log_config.start()
-
-        scf.cf.platform.send_arming_request(True)
-        time.sleep(1.0)
-        
-        # Instantiate Navigation Manager Thread
-        nav_manager = NavigationManager(
-            get_pose_func=lambda: dict(latest_pose),
-            get_grid_func=lambda: global_map,
-            goal=TARGET_CENTER
-        )
-        nav_manager.start_planner_thread()
-
-        mission_state = MissionState.NAVIGATING
-        sweep_waypoints = generate_concentric_sweep(TARGET_GOAL_AREA)
-        active_sweep_target = None
-
-        with MotionCommander(scf, default_height=0.3) as motion_commander:
-            with Multiranger(scf) as multi_ranger:
-
-                print("Autonomous Flight System Online!")
-
-                while mission_state != MissionState.FINISHED:
-                    loop_start = time.time()
-                    
-                    # Read current path dots from navigation manager
-                    with nav_manager.path_lock:
-                        dots_to_draw = list(nav_manager.current_dots)
-
-                    # Pass dots to visualization renderer
-                    process_plot_updates(current_dots=dots_to_draw)
-
-                    curr_x = latest_pose['x']
-                    curr_y = latest_pose['y']
-
-                    # Clean, readable usage in your main loop:
-                    ranger_data = (
-                        to_meters(multi_ranger.front),
-                        to_meters(multi_ranger.back),
-                        to_meters(multi_ranger.left),
-                        to_meters(multi_ranger.right),
-                    )
-
-                    # Hand off flight phase management
-                    if mission_state == MissionState.NAVIGATING:
-                        # Check if inside target goal region
-                        if (TARGET_GOAL_AREA[0] <= curr_x <= TARGET_GOAL_AREA[1] and 
-                            TARGET_GOAL_AREA[2] <= curr_y <= TARGET_GOAL_AREA[3]):
-                            print("Entered Target Goal Region! Switching to Sweep Mode...")
-                            mission_state = MissionState.SWEEPING
-                            continue
-
-                        # Compute 50 Hz velocity command toward goal
-                        vx, vy, yaw_rate = nav_manager.get_control_command(latest_pose, ranger_data)
-                        motion_commander.start_linear_motion(vx, vy, 0.0, yaw_rate)
-
-                    elif mission_state == MissionState.SWEEPING:
-                        if active_sweep_target is None and sweep_waypoints:
-                            active_sweep_target = sweep_waypoints.pop(0)
-
-                        if active_sweep_target:
-                            # Update planner goal to current sweep point
-                            nav_manager.goal = active_sweep_target
-                            dist_to_sweep_pt = math.hypot(active_sweep_target[0] - curr_x, active_sweep_target[1] - curr_y)
-
-                            if dist_to_sweep_pt < 0.15:
-                                active_sweep_target = None  # Reached, advance to next point
-                            else:
-                                vx, vy, yaw_rate = nav_manager.get_control_command(latest_pose, ranger_data)
-                                motion_commander.start_linear_motion(vx, vy, 0.0, yaw_rate)
-                        else:
-                            print("Area Sweep Complete! Landing...")
-                            motion_commander.stop()
-                            mission_state = MissionState.FINISHED
-
-                    # Emergency kill switch check (hand directly over top sensor)
-                    if multi_ranger.up and multi_ranger.up < 0.2:
-                        print("Emergency Up-sensor triggered. Aborting mission!")
-                        motion_commander.stop()
-                        break
-
-                    # Maintain 50 Hz loop execution
-                    elapsed = time.time() - loop_start
-                    time.sleep(max(0.005, 0.02 - elapsed))
-
-            nav_manager.stop()
-            log_config.stop()
-            print('Demo terminated!')
-
-    # --- CSV Export ---
-    filename = "flight_log.csv"
-    headers = ["timestamp (us)", "front", "back", "left", "right", "up", "zrange", "X", "Y", "Yaw"]
-    
-    with open(filename, mode="w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["# Metadata"])
-        writer.writerow(["# Map Length (m)", map_len])
-        writer.writerow(["# Map Width (m)", map_width])
-        writer.writerow(["# Start X (m)", start_x])
-        writer.writerow(["# Start Y (m)", start_y])
-        writer.writerow(["# --- Data Start ---"])
-        writer.writerow(headers)
-        writer.writerows(csv_history)
-        
-    print(f"Successfully saved {len(csv_history)} data rows to '{filename}'")
-
-    plt.ioff()
-    plt.show()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('uri', nargs='?', default=DEFAULT_URI)
+    parser.add_argument('--turn-every', type=int, default=TURN_EVERY_WAYPOINTS,
+                        help='Rotate in place every N reached waypoints (positive integer)')
+    parser.add_argument('--no-plot', action='store_true', help='Disable the live dashboard')
+    parser.add_argument('--plot-hz', type=float, default=5., help='Dashboard refresh rate (default: 5 Hz)')
+    parser.add_argument('--replay', help='Existing CSV; no drone/radio connection')
+    parser.add_argument('--output', default='flight_log_slam.csv')
+    args = parser.parse_args()
+    if not math.isfinite(args.plot_hz) or not 0. < args.plot_hz <= 30.:
+        parser.error("--plot-hz must be greater than 0 and at most 30")
+    if args.turn_every < 1:
+        parser.error("--turn-every must be at least 1")
+    if args.replay:
+        replay(args.replay, args.output)
+    else:
+        fly(args.uri, args.output, turn_every=args.turn_every,
+            show_plot=not args.no_plot, plot_hz=args.plot_hz)

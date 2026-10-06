@@ -1,271 +1,248 @@
-"""
-planner.py - Two-Tier Navigation Stack for Crazyflie SLAM
-
-Contains:
-1. FastRaycasterPlanner: High-level 10 Hz path generator with deadlock recovery.
-2. LocalReactiveController: High-rate (50 Hz) motion controller with anti-oscillation
-   and 90-degree heading yaw scanning for improved sensor coverage.
-"""
-
-import time
+"""Stable global route + continuous, drift-tolerant velocity following."""
+import heapq
 import math
 import threading
-import numpy as np
+import time
+from slam import CLEARANCE, wrap
 
 
-class FastRaycasterPlanner:
-    """
-    High-Level Global Planner (10 Hz).
-    Generates a list of path 'dots' from current location to goal.
-    """
-    def __init__(self, step_len=0.25, max_steps=30):
-        self.step_len = step_len
-        self.max_steps = max_steps
-        self.blocked_timer = None
-        self.recovery_active = False
+def projection(p, a, b):
+    """Progress along an edge, and sideways distance from its supporting line."""
+    dx, dy = b[0]-a[0], b[1]-a[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return 1., math.dist(p, b)
+    t = ((p[0]-a[0])*dx+(p[1]-a[1])*dy)/length**2
+    return t, abs((p[0]-a[0])*dy-(p[1]-a[1])*dx)/length
 
-    def generate_path_dots(self, start, goal, occupancy_grid):
-        """
-        Calculates path dots spaced at `step_len` meters toward goal.
-        Includes deadlock detection for triggering recovery rotations.
-        """
-        curr_x, curr_y = start
-        goal_x, goal_y = goal
-        dots = [(curr_x, curr_y)]
 
-        reached_or_progressed = False
-
-        for _ in range(self.max_steps):
-            dist_to_goal = math.hypot(goal_x - curr_x, goal_y - curr_y)
-            
-            if dist_to_goal <= self.step_len:
-                dots.append((goal_x, goal_y))
-                reached_or_progressed = True
+def plan_route(start, goal, grid):
+    """A* over the inflated occupancy grid; unknown cells remain traversable."""
+    blocked = grid.costmap()
+    def valid(cell):
+        c, r = cell
+        return 0 <= c < grid.cols and 0 <= r < grid.rows and not blocked[c, r]
+    def clear(a, b):
+        return grid.segment_clear(a, b, blocked)
+    source, target = grid.world_to_grid(*start), grid.world_to_grid(*goal)
+    if not valid(source) or not valid(target):
+        return []
+    if clear(start, goal):
+        points = [start, goal]
+    else:
+        heap, costs, parents = [(math.dist(source, target), 0., source)], {source: 0.}, {}
+        neighbors = [(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1) if x or y]
+        while heap:
+            _, cost, cell = heapq.heappop(heap)
+            if cost > costs[cell]:
+                continue
+            if cell == target:
                 break
-
-            angle = math.atan2(goal_y - curr_y, goal_x - curr_x)
-            next_x = curr_x + self.step_len * math.cos(angle)
-            next_y = curr_y + self.step_len * math.sin(angle)
-
-            # Check for grid collision (threshold 0.7)
-            if occupancy_grid.is_occupied(next_x, next_y, threshold=0.7):
-                found_detour = False
-                # Search surrounding detour angles
-                for offset_deg in [45, -45, 90, -90, 135, -135]:
-                    alt_angle = angle + math.radians(offset_deg)
-                    alt_x = curr_x + self.step_len * math.cos(alt_angle)
-                    alt_y = curr_y + self.step_len * math.sin(alt_angle)
-
-                    if not occupancy_grid.is_occupied(alt_x, alt_y, threshold=0.7):
-                        next_x, next_y = alt_x, alt_y
-                        found_detour = True
-                        break
-
-                if not found_detour:
-                    # Path is completely blocked
-                    break
-
-            dots.append((next_x, next_y))
-            curr_x, curr_y = next_x, next_y
-            reached_or_progressed = True
-
-        # --- Problem 3 Fix: Deadlock Recovery Logic ---
-        if not reached_or_progressed or len(dots) <= 1:
-            if self.blocked_timer is None:
-                self.blocked_timer = time.time()
-            elif time.time() - self.blocked_timer > 3.0: # Blocked > 3 seconds
-                self.recovery_active = True
-        else:
-            self.blocked_timer = None
-            self.recovery_active = False
-
-        return dots, self.recovery_active
+            for dx, dy in neighbors:
+                nxt = (cell[0]+dx, cell[1]+dy)
+                if not valid(nxt):
+                    continue
+                if dx and dy and (not valid((cell[0]+dx, cell[1])) or
+                                  not valid((cell[0], cell[1]+dy))):
+                    continue
+                new = cost+math.hypot(dx, dy)
+                if new < costs.get(nxt, float('inf')):
+                    costs[nxt], parents[nxt] = new, cell
+                    heapq.heappush(heap, (new+math.dist(nxt, target), new, nxt))
+        if target not in costs:
+            return []
+        cells, cell = [target], target
+        while cell != source:
+            cell = parents[cell]
+            cells.append(cell)
+        points = [start]+[grid.grid_to_world(*c) for c in reversed(cells)][1:-1]+[goal]
+        # Remove redundant cell-by-cell dots without cutting obstacle corners.
+        simple, index = [start], 0
+        while index < len(points)-1:
+            nxt = len(points)-1
+            while nxt > index+1 and not clear(points[index], points[nxt]):
+                nxt -= 1
+            if not clear(points[index], points[nxt]):
+                return []
+            simple.append(points[nxt])
+            index = nxt
+        points = simple
+    route = [start]
+    for a, b in zip(points, points[1:]):
+        count = max(1, math.ceil(math.dist(a, b)/.40))
+        route.extend((a[0]+(b[0]-a[0])*i/count, a[1]+(b[1]-a[1])*i/count)
+                     for i in range(1, count+1))
+    return route
 
 
-class LocalReactiveController:
-    """
-    Low-Level Reactive Controller (50 Hz).
-    Implements a strict 'Stop -> Scan Yaw -> Realign -> Resume' sequence at discrete waypoints.
-    """
-    def __init__(self, target_speed=0.20, min_safety_dist=0.25, lookahead_dist=0.35, 
-                 scan_interval=2, yaw_tolerance_deg=8.0):
-        self.target_speed = target_speed
-        self.min_safety_dist = min_safety_dist
-        self.lookahead_dist = lookahead_dist
-        self.scan_interval = scan_interval          # 1 = Every waypoint, 2 = Every second
-        self.yaw_tolerance_deg = yaw_tolerance_deg  # Alignment threshold in degrees
+class Navigator:
+    def __init__(self, grid, goal, turn_every=3):
+        self.grid, self.goal = grid, goal
+        if not isinstance(turn_every, int) or isinstance(turn_every, bool) or turn_every < 1:
+            raise ValueError("turn_every must be a positive integer")
+        self.cruise_speed = .25
+        self.lookahead, self.arrival_tolerance, self.pass_corridor = .55, .15, .30
+        self.turn_every, self.max_yaw_rate = turn_every, 45.
+        self.yaw_tolerance = 3.  # Resume translation once the scheduled turn is within 3 degrees.
+        self.lock = threading.Lock()
+        self.route, self.index, self.revision = [], 1, 0
+        self.reached, self.pending_turns, self.turn_sign = 0, 0, 1
+        self.desired_yaw, self.turn_started = None, None
+        self.state, self.reason, self.target, self.fault = 'WAIT_PATH', '', None, None
+        self.last_plan, self.no_path_since = -float('inf'), None
+        self.progress_anchor, self.progress_time = None, None
 
-        # Hysteresis / Anti-Oscillation Memory
-        self.last_avoid_dir = 0
-        self.avoid_lock_time = 0.0
+    def update_route(self, pose, now=None):
+        """Worker call. Preserve the route unless blocked or substantially off it."""
+        now = time.monotonic() if now is None else now
+        if now-self.last_plan < .7:
+            return
+        p, blocked = (pose['x'], pose['y']), self.grid.costmap()
+        with self.lock:
+            if self.turn_started is not None:
+                return  # Keep waypoint identities stable during an in-place turn.
+            route, index, revision = list(self.route), self.index, self.revision
+        replace = len(route) < 2
+        if index < len(route):
+            t, cross = projection(p, route[index-1], route[index])
+            deviation = cross if 0 <= t <= 1 else math.dist(p, route[index-1] if t < 0 else route[index])
+            remaining = [p]+route[index:]
+            replace |= deviation > .45 or any(not self.grid.segment_clear(a, b, blocked)
+                                             for a, b in zip(remaining, remaining[1:]))
+        if replace:
+            new_route = plan_route(p, self.goal, self.grid)
+            with self.lock:
+                if revision == self.revision and self.turn_started is None:
+                    self.route, self.index = new_route, 1
+                    self.revision += 1
+        self.last_plan = now
 
-        # State Machine Flags
-        self.last_waypoint_idx = -1
-        self.waypoint_visit_count = 0
-        self.scan_phase = 1.0  # Alternates +1 (+90 deg) and -1 (-90 deg)
-        
-        # Internal States: 'NAVIGATING', 'SCANNING', 'REALIGNING'
+    @staticmethod
+    def velocity_limit(distance):
+        """Limit only the component toward a nearby surface. Unknown: creep speed.
+        Model: v*reaction_time + v²/(2*deceleration) <= surface_range-clearance.
+        """
+        if distance is None or not math.isfinite(distance) or distance <= 0:
+            return .05
+        room = max(0., distance-CLEARANCE)
+        acceleration, delay = .4, .20
+        return max(0., math.sqrt((acceleration*delay)**2+2*acceleration*room)-acceleration*delay)
+
+    def command(self, pose, ranges, now=None):
+        now = time.monotonic() if now is None else now
+        # The worker can replace the route only between complete command updates.
+        with self.lock:
+            return self._command(pose, ranges, now)
+
+    def _rotation_command(self, yaw, now):
+        """Return yaw-only motion, or None when this scheduled turn is complete."""
+        error = wrap(self.desired_yaw-yaw)
+        if abs(error) <= self.yaw_tolerance:
+            self.turn_started = None
+            return None
+        if now-self.turn_started > 8.:
+            self.fault = 'Yaw turn timed out'
+            return 0., 0., 0.
+        self.state, self.reason = 'ROTATING', 'scheduled_turn'
+        rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, 2.*error))
+        return 0., 0., rate  # Never send translation while rotating.
+
+    def _command(self, pose, ranges, now):
+        if self.fault:
+            return 0., 0., 0.
+        p = (pose['x'], pose['y'])
+        yaw = pose['yaw']
+        if not all(math.isfinite(v) for v in (*p, yaw)):
+            self.fault = 'Invalid pose'
+            return 0., 0., 0.
+        # Watch real odometry displacement, not changes caused by SLAM corrections.
+        odom = (pose.get('odom_x', p[0]), pose.get('odom_y', p[1]))
+        if self.desired_yaw is None:
+            self.desired_yaw = yaw
+            self.progress_anchor, self.progress_time = odom, now
+        if self.turn_started is not None:
+            rotation = self._rotation_command(yaw, now)
+            if rotation is not None:
+                return rotation  # Do not count waypoints or chase XY drift during yaw.
+            # Rotation is intentionally stationary; restart the progress watchdog.
+            self.progress_anchor, self.progress_time = odom, now
+        if len(self.route) < 2:
+            self.state, self.reason = 'WAIT_PATH', 'no_route'
+            self.no_path_since = now if self.no_path_since is None else self.no_path_since
+            if now-self.no_path_since > 10.:
+                self.fault = 'No map route for 10 seconds'
+            return 0., 0., 0.
+        self.no_path_since = None
+        while self.index < len(self.route):
+            t, cross = projection(p, self.route[self.index-1], self.route[self.index])
+            if not (math.dist(p, self.route[self.index]) <= self.arrival_tolerance or
+                    (self.index < len(self.route)-1 and t >= 1. and cross <= self.pass_corridor)):
+                break
+            self.index += 1
+            self.reached += 1
+            if self.reached % self.turn_every == 0:
+                self.pending_turns += 1
+        if self.index == len(self.route):
+            self.state, self.reason = 'PATH_END', 'route_complete'
+            return 0., 0., 0.
+        if self.pending_turns:
+            self.desired_yaw = wrap(self.desired_yaw+90.*self.turn_sign)
+            self.turn_sign *= -1
+            self.pending_turns -= 1
+            self.turn_started = now
+            rotation = self._rotation_command(yaw, now)
+            if rotation is not None:
+                return rotation
+            self.progress_anchor, self.progress_time = odom, now
+        # Between scheduled turns, yaw rate is zero as well. Translation and yaw
+        # commands never overlap, including the final few degrees of alignment.
+        yaw_rate = 0.
+        # Aim ahead, instead of stopping to center over each dot.
+        a, b = self.route[self.index-1], self.route[self.index]
+        t, _ = projection(p, a, b)
+        t = min(1., max(0., t))
+        cursor = (a[0]+t*(b[0]-a[0]), a[1]+t*(b[1]-a[1]))
+        remaining, target = self.lookahead, b
+        for point in self.route[self.index:]:
+            distance = math.dist(cursor, point)
+            if distance >= remaining and distance > 1e-9:
+                target = (cursor[0]+(point[0]-cursor[0])*remaining/distance,
+                          cursor[1]+(point[1]-cursor[1])*remaining/distance)
+                break
+            remaining -= distance
+            cursor = target = point
+        blocked = self.grid.costmap()
+        if not self.grid.segment_clear(p, target, blocked):
+            target = b                    # Shorten lookahead to avoid cutting a corner.
+        self.target = target
+        dx, dy = target[0]-p[0], target[1]-p[1]
+        distance = math.hypot(dx, dy)
+        if distance < 1e-9:
+            return 0., 0., yaw_rate
+        speed = self.cruise_speed
+        speed = min(speed, max(.05, 1.2*math.dist(p, self.goal)))
+        wx, wy = speed*dx/distance, speed*dy/distance
+        # MotionCommander takes BODY velocities: +X forward, +Y left.
+        angle = math.radians(yaw)
+        c, s = math.cos(angle), math.sin(angle)
+        bx, by = wx*c+wy*s, -wx*s+wy*c
+        front, back, left, right = ranges
+        bx = max(-self.velocity_limit(back), min(self.velocity_limit(front), bx))
+        by = max(-self.velocity_limit(right), min(self.velocity_limit(left), by))
+        # Check the combined velocity too; separate axes must not cut a mapped corner.
+        wx, wy = bx*c-by*s, bx*s+by*c
+        self.reason = 'clear'
+        if not self.grid.segment_clear(p, (p[0]+.35*wx, p[1]+.35*wy), blocked):
+            bx = by = 0.
+            self.reason = 'map_blocks_motion'
+        elif math.hypot(bx, by) < .01:
+            self.reason = 'range_blocks_motion'
         self.state = 'NAVIGATING'
-        self.target_yaw_angle = 0.0
-
-    def compute_motion(self, current_pose, path_dots, ranger_data, recovery_flag=False):
-        cx, cy, cyaw = current_pose['x'], current_pose['y'], current_pose['yaw']
-        now = time.time()
-
-        # Handle emergency recovery spin
-        if recovery_flag:
-            self.state = 'NAVIGATING'
-            return 0.0, 0.0, 30.0
-
-        if len(path_dots) < 2:
-            return 0.0, 0.0, 0.0
-
-        # --- Dynamic Lookahead Target Selection ---
-        target_dot = path_dots[-1]
-        active_idx = len(path_dots) - 1
-
-        for i, dot in enumerate(path_dots):
-            dist = math.hypot(dot[0] - cx, dot[1] - cy)
-            if dist >= self.lookahead_dist:
-                target_dot = dot
-                active_idx = i
-                break
-
-        # Line-of-flight heading toward lookahead dot
-        travel_angle_deg = math.degrees(math.atan2(target_dot[1] - cy, target_dot[0] - cx))
-
-        # --- Waypoint Arrival Detector ---
-        if active_idx != self.last_waypoint_idx:
-            self.last_waypoint_idx = active_idx
-            self.waypoint_visit_count += 1
-
-            # Check if this waypoint triggers a scan pause
-            if self.waypoint_visit_count % self.scan_interval == 0:
-                self.state = 'SCANNING'
-                self.scan_phase *= -1.0  # Alternate scan side
-                # Freeze target scan heading relative to initial travel angle
-                self.target_yaw_angle = (travel_angle_deg + (90.0 * self.scan_phase)) % 360.0
-
-        # =========================================================================
-        # STATE 1: SCANNING (Rotate to +90 / -90 degrees in place)
-        # =========================================================================
-        if self.state == 'SCANNING':
-            yaw_err = (self.target_yaw_angle - cyaw + 180) % 360 - 180
-            yaw_rate = float(np.clip(yaw_err * 1.5, -45.0, 45.0))
-
-            if abs(yaw_err) > self.yaw_tolerance_deg:
-                return 0.0, 0.0, yaw_rate  # Zero translation while scanning
-            else:
-                # Target scan angle reached -> Transition to realigning phase
-                self.state = 'REALIGNING'
-
-        # =========================================================================
-        # STATE 2: REALIGNING (Rotate back to face line-of-flight)
-        # =========================================================================
-        if self.state == 'REALIGNING':
-            flight_yaw_err = (travel_angle_deg - cyaw + 180) % 360 - 180
-            yaw_rate = float(np.clip(flight_yaw_err * 1.5, -45.0, 45.0))
-
-            if abs(flight_yaw_err) > self.yaw_tolerance_deg:
-                return 0.0, 0.0, yaw_rate  # Zero translation while re-aligning
-            else:
-                # Fully aligned with flight path -> Resume normal flight
-                self.state = 'NAVIGATING'
-
-        # =========================================================================
-        # STATE 3: NAVIGATING (Translate forward along flight path)
-        # =========================================================================
-        flight_yaw_err = (travel_angle_deg - cyaw + 180) % 360 - 180
-        yaw_rate = float(np.clip(flight_yaw_err * 1.5, -45.0, 45.0))
-
-        # Rotate-first check for flight direction alignment
-        if abs(flight_yaw_err) > self.yaw_tolerance_deg:
-            return 0.0, 0.0, yaw_rate
-
-        # Compute translation velocity
-        angle_to_target = math.atan2(target_dot[1] - cy, target_dot[0] - cx)
-        vx_global = self.target_speed * math.cos(angle_to_target)
-        vy_global = self.target_speed * math.sin(angle_to_target)
-
-        # Convert to Body Frame
-        yaw_rad = math.radians(cyaw)
-        vx_body =  vx_global * math.cos(yaw_rad) + vy_global * math.sin(yaw_rad)
-        vy_body = -vx_global * math.sin(yaw_rad) + vy_global * math.cos(yaw_rad)
-
-        # Reactive Obstacle Avoidance
-        front, back, left, right = ranger_data
-        repulsion_x, repulsion_y = 0.0, 0.0
-
-        if front < self.min_safety_dist:
-            repulsion_x -= (self.min_safety_dist - front) * 2.5
-        if back < self.min_safety_dist:
-            repulsion_x += (self.min_safety_dist - back) * 2.5
-
-        if left < self.min_safety_dist or right < self.min_safety_dist:
-            if now > self.avoid_lock_time:
-                self.last_avoid_dir = -1 if left < right else 1
-                self.avoid_lock_time = now + 0.8
-
-            if self.last_avoid_dir == -1:
-                repulsion_y -= 0.15
-            else:
-                repulsion_y += 0.15
-        else:
-            if now > self.avoid_lock_time:
-                self.last_avoid_dir = 0
-
-        final_vx = float(np.clip(vx_body + repulsion_x, -0.3, 0.3))
-        final_vy = float(np.clip(vy_body + repulsion_y, -0.3, 0.3))
-
-        return final_vx, final_vy, yaw_rate
-
-    
-class NavigationManager:
-    """
-    Thread-safe thread launcher for the dual-loop setup.
-    """
-    def __init__(self, get_pose_func, get_grid_func, goal):
-        self.get_pose_func = get_pose_func
-        self.get_grid_func = get_grid_func
-        self.goal = goal
-
-        self.planner = FastRaycasterPlanner(step_len=0.25)
-        self.controller = LocalReactiveController(scan_interval=2)
-
-        self.path_lock = threading.Lock()
-        self.current_dots = []
-        self.recovery_flag = False
-        self.running = True
-
-    def start_planner_thread(self):
-        thread = threading.Thread(target=self._global_loop, daemon=True)
-        thread.start()
-
-    def _global_loop(self):
-        """10 Hz Thread for updates."""
-        while self.running:
-            loop_start = time.time()
-            pose = self.get_pose_func()
-            grid = self.get_grid_func()
-
-            if pose and grid:
-                start_pt = (pose['x'], pose['y'])
-                dots, recovery = self.planner.generate_path_dots(start_pt, self.goal, grid)
-
-                with self.path_lock:
-                    self.current_dots = dots
-                    self.recovery_flag = recovery
-
-            elapsed = time.time() - loop_start
-            time.sleep(max(0.01, 0.10 - elapsed))
-
-    def get_control_command(self, current_pose, ranger_data):
-        """Called inside your 50 Hz main thread hardware loop."""
-        with self.path_lock:
-            dots = list(self.current_dots)
-            recovery = self.recovery_flag
-
-        return self.controller.compute_motion(current_pose, dots, ranger_data, recovery)
-
-    def stop(self):
-        self.running = False
+        if math.hypot(bx, by) < .01:
+            self.state = 'BLOCKED'
+        if math.dist(odom, self.progress_anchor) >= .08:
+            self.progress_anchor, self.progress_time = odom, now
+        elif now-self.progress_time > 12.:
+            self.fault = 'No odometry displacement for 12 seconds'
+            return 0., 0., 0.
+        return bx, by, yaw_rate

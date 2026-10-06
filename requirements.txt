@@ -1,6 +1,4 @@
-cflib
-pandas
-matplotlib
-ipympl
-plotly
-nbformat
+numpy>=1.24
+scipy>=1.10
+cflib>=0.1.24
+matplotlib>=3.7
