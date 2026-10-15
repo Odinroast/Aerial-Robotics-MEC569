@@ -1,3 +1,5 @@
 crazyflie-clients-python/
 cache/
 venv/
+flight*
+box_log*
