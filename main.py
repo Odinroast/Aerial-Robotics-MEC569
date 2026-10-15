@@ -1,267 +1,183 @@
-"""Run: python3 main.py [radio URI]
-Offline replay: python3 main.py --replay old_flight_log.csv --output replay.csv
-Telemetry callback only copies data. One worker maps/plans; the main loop flies.
+"""Fly a Crazyflie (Flow deck + Multi-ranger deck) from START to GOAL, avoiding obstacles.
+
+    python3 main.py                      # default radio URI
+    python3 main.py radio://0/80/2M/E7E7E7E7E7 --goal 2.0 0.5
+
+Place the drone at START facing map +X. It takes off, then repeats: stop, turn in place
+to +45/-45/0 degrees so the four rangers map the surroundings, and fly up to 1 m with the
+nose held at 0 (it never turns and moves at the same time). A range guard backs away from
+anything closer than 25 cm. It lands on arrival, on Ctrl+C, and on any fault: no path,
+no progress, pose jump, yaw drift, lost telemetry, or lost height. A CSV log and a PNG
+plot are saved.
 """
 import argparse
 import csv
+from datetime import datetime
 import math
-import queue
 import threading
 import time
-from collections import Counter
-import numpy as np
-from slam import GlobalOccupancyGrid, GridSLAM, MAX_RANGE
-from planner import Navigator
+from planner import MIN_CLEARANCE, Navigator
 
-START = (.3, 0.)
-GOAL = (4.35, 0.)
-GOAL_AREA = (4.1, 4.6, -.25, .25)
-HEIGHT = .8
-TURN_EVERY_WAYPOINTS = 3  # Set to 3, 4, etc.; CLI --turn-every overrides this.
+START = (0.3, 0.0)                    # Map position of the drone at takeoff, m.
+GOAL = (3.5, -1.5)                     # Target position, m.
+HEIGHT = 0.5                          # Flight height, m.
+# Optional virtual fence (x_min, x_max, y_min, y_max) in map meters. Keep it None unless
+# the space really is that box: the drone keeps clear of the fence like a wall, so a
+# fence that cuts through a doorway closes it.
+ARENA = None
+MISSION_SECONDS = 180.
+HEIGHT_TOLERANCE = 0.15               # Land if the z-ranger stays off HEIGHT by more than this...
+HEIGHT_SECONDS = 0.3                  # ...for this long (contact, prop strike, or drift).
 DEFAULT_URI = 'radio://0/98/2M/E7E7E7E7E8'
 DIRECTIONS = ('front', 'back', 'left', 'right', 'up', 'zrange')
+FIELDS = ['time', 'state', 'reason', 'x', 'y', 'yaw', 'odom_x', 'odom_y', 'odom_yaw',
+          *DIRECTIONS, 'cmd_vx', 'cmd_vy', 'cmd_yaw_rate', 'heading', 'free', 'goal_distance']
 
 
 def meters(mm):
-    """Firmware range.* values are millimeters. Convert ONCE; keep unknown unknown."""
-    value = float(mm)/1000.
-    return value if math.isfinite(value) and 0. < value < MAX_RANGE else float('nan')
+    """Ranger value in mm -> meters; NaN for no return / out of range."""
+    value = mm/1000.
+    return value if 0.02 < value < 4.0 else float('nan')
 
 
-def save_rows(path, rows):
-    if rows:
-        with open(path, 'w', newline='') as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
+class Frame:
+    """Map frame anchored at START: the first post-takeoff pose becomes START, heading 0."""
+    def __init__(self, odom):
+        self.ox, self.oy, self.oyaw = odom
+        self.c, self.s = math.cos(math.radians(-self.oyaw)), math.sin(math.radians(-self.oyaw))
+
+    def pose(self, odom):
+        dx, dy = odom[0]-self.ox, odom[1]-self.oy
+        return (START[0] + self.c*dx - self.s*dy, START[1] + self.s*dx + self.c*dy,
+                (odom[2]-self.oyaw+180.) % 360. - 180.)
 
 
-def replay(path, output):
-    """Replay recorded odometry/ranges. This cannot validate true position accuracy."""
-    grid, rows, counts = GlobalOccupancyGrid(), [], Counter()
-    slam = GridSLAM(grid, START)
-    last = -float('inf')
-    with open(path, newline='') as file:
-        reader = csv.DictReader(line for line in file if not line.startswith('#'))
-        for row in reader:
-            stamp = float(row['timestamp (ms)'])/1000.
-            odom = {'x': float(row.get('raw_X') or row['X']),
-                    'y': float(row.get('raw_Y') or row['Y']), 'yaw': float(row.get('raw_Yaw') or row['Yaw'])}
-            slam.corrected_pose(odom)
-            if row.get('controller_state') == 'GROUND' or stamp-last < .049:
-                continue
-            # Old CSV range columns are already meters, not millimeters.
-            ranges = tuple(float(row[d]) if 0 < float(row[d]) < MAX_RANGE else float('nan')
-                           for d in DIRECTIONS[:4])
-            slam.update(stamp, odom, ranges)
-            pose, diag = slam.corrected_pose(odom), slam.diagnostics()
-            counts[diag['slam_state']] += 1
-            rows.append({'timestamp (ms)': row['timestamp (ms)'], 'raw_X': odom['x'],
-                         'raw_Y': odom['y'], 'raw_Yaw': odom['yaw'],
-                         'X': pose['x'], 'Y': pose['y'], 'Yaw': pose['yaw'], **diag})
-            last = stamp
-    save_rows(output, rows)
-    print('Replay SLAM states:', dict(counts))
-    print('Final map-to-odometry transform:', slam.diagnostics())
-    print('Saved', output)
-
-
-def fly(uri, output, turn_every=TURN_EVERY_WAYPOINTS, show_plot=True, plot_hz=5.):
-    # Import radio dependencies only for flight. Offline tests/replay need no cflib.
+def fly(uri, output):
     import cflib.crtp
     from cflib.crazyflie import Crazyflie
-    from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
     from cflib.crazyflie.log import LogConfig
+    from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
     from cflib.positioning.motion_commander import MotionCommander
 
-    grid = GlobalOccupancyGrid()
-    slam, nav = GridSLAM(grid, START), Navigator(grid, GOAL, turn_every=turn_every)
-    samples, stop = queue.Queue(maxsize=1), threading.Event()
-    data_lock = threading.Lock()
-    latest, worker_state, history = {}, {'heartbeat': time.monotonic(), 'error': None}, []
-    live_state = {'command': (0., 0., 0.), 'phase': 'GROUND'}
-    plotter = None
+    latest, lock = {}, threading.Lock()
 
-    def get_live_sample():
-        with data_lock:
-            sample = dict(latest)
-            if sample:
-                sample.update(live_state)
-            return sample
+    def on_log(timestamp, data, _):
+        with lock:
+            latest.update(received=time.monotonic(),
+                          odom=(data['stateEstimate.x'], data['stateEstimate.y'], data['stateEstimate.yaw']),
+                          ranges=tuple(meters(data['range.'+d]) for d in DIRECTIONS))
 
-    def callback(timestamp, data, _):
-        odom = {'x': data['stateEstimate.x'], 'y': data['stateEstimate.y'],
-                'yaw': data['stateEstimate.yaw']}
-        if not all(math.isfinite(v) for v in odom.values()):
-            return                         # Existing telemetry-age check will stop flight.
-        sample = {'timestamp': timestamp, 'received': time.monotonic(), 'odom': odom,
-                  'ranges': tuple(meters(data['range.'+d]) for d in DIRECTIONS),
-                  'raw_ranges': tuple(data['range.'+d] for d in DIRECTIONS)}
-        with data_lock:
-            latest.clear()
-            latest.update(sample)
-        # Overwrite old queued samples: never build a backlog behind live flight.
-        try:
-            samples.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            samples.put_nowait(sample)
-        except queue.Full:
-            pass
+    def sample():
+        with lock:
+            return dict(latest)
 
-    def worker():
-        last_timestamp = None
-        try:
-            while not stop.is_set():
-                try:
-                    sample = samples.get(timeout=.1)
-                except queue.Empty:
-                    continue
-                if sample['timestamp'] == last_timestamp:
-                    continue
-                last_timestamp = sample['timestamp']
-                slam.update(sample['received'], sample['odom'], sample['ranges'][:4])
-                pose = slam.corrected_pose(sample['odom'])
-                nav.update_route(pose)
-                with data_lock:
-                    worker_state['heartbeat'] = time.monotonic()
-        except Exception as error:
-            with data_lock:
-                worker_state['error'] = str(error)
+    def fresh_sample(after, timeout=1.):
+        deadline = time.monotonic()+timeout
+        while time.monotonic() < deadline:
+            s = sample()
+            if s and s['received'] > after and all(map(math.isfinite, s['odom'])):
+                return s
+            time.sleep(.01)
+        raise RuntimeError('No fresh telemetry')
 
+    if ARENA is not None:
+        x0, x1, y0, y1 = ARENA
+        m = MIN_CLEARANCE
+        for name, (px, py) in (('START', START), ('GOAL', GOAL)):
+            if not (x0+m <= px <= x1-m and y0+m <= py <= y1-m):
+                raise SystemExit(f'{name} {(px, py)} is not at least {m} m inside ARENA {ARENA}; '
+                                 'move it or set ARENA = None')
+    nav = Navigator(GOAL, ARENA)
+    result = 'not started'
     cflib.crtp.init_drivers()
-    log = LogConfig(name='Navigation', period_in_ms=50)  # 20 Hz, synchronized telemetry.
-    for direction in DIRECTIONS:
-        log.add_variable('range.'+direction, 'uint16_t')
-    for axis in ('x', 'y', 'yaw'):
-        log.add_variable('stateEstimate.'+axis, 'float')
-    thread = None
-    try:
-        with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
-            scf.cf.log.add_config(log)
-            log.data_received_cb.add_callback(callback)
-            log.start()
-            deadline = time.monotonic()+5.
-            while not latest and time.monotonic() < deadline:
-                time.sleep(.05)
-            with data_lock:
-                initial = dict(latest)
-            if not initial:
-                raise RuntimeError('No telemetry received; flight not started')
-            slam.corrected_pose(initial['odom'])  # Anchor map at START while grounded.
-            if show_plot:
-                from plotter import LivePlotter
-                try:
-                    plotter = LivePlotter(grid, slam, nav, get_live_sample, START, GOAL, GOAL_AREA,
-                                          update_hz=plot_hz)
-                    plotter.start()
-                except Exception as error:
-                    print('Could not start dashboard; flight continues:', error)
-            with data_lock:
-                live_state['phase'] = 'TAKEOFF'
+    with open(output, 'w', newline='') as file, \
+            SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
+        log = csv.DictWriter(file, fieldnames=FIELDS)
+        log.writeheader()
+        config = LogConfig(name='nav', period_in_ms=50)
+        for d in DIRECTIONS:
+            config.add_variable('range.'+d, 'uint16_t')
+        for axis in ('x', 'y', 'yaw'):
+            config.add_variable('stateEstimate.'+axis, 'float')
+        scf.cf.log.add_config(config)
+        config.data_received_cb.add_callback(on_log)
+        config.start()
+        try:
+            fresh_sample(0., timeout=5.)
             scf.cf.platform.send_arming_request(True)
             time.sleep(1.)
-            try:
-                with MotionCommander(scf, default_height=HEIGHT) as motion:
-                    # Start mapping only after takeoff: ground readings do not enter the map.
-                    with data_lock:
-                        worker_state['heartbeat'] = time.monotonic()
-                        live_state['phase'] = 'NAVIGATING'
-                    thread = threading.Thread(target=worker, daemon=True)
-                    thread.start()
-                    mission_start = last_print = time.monotonic()
-                    print(f'Navigation started: radius 0.10 m, margin 0.04 m, turn every {turn_every} waypoints')
-                    try:
-                        while True:
-                            now = time.monotonic()
-                            with data_lock:
-                                sample, health = dict(latest), dict(worker_state)
-                            if now-sample['received'] > .5 or now-health['heartbeat'] > 2.:
-                                print('Telemetry or SLAM worker stale; landing')
-                                motion.stop()
-                                break
-                            if health['error']:
-                                print('Mapping/planning failed:', health['error'])
-                                motion.stop()
-                                break
-                            if now-mission_start > 180.:
-                                print('Mission time limit reached; landing')
-                                motion.stop()
-                                break
-                            pose = slam.corrected_pose(sample['odom'])
-                            ranges = sample['ranges']
-                            if math.isfinite(ranges[4]) and ranges[4] < .20:
-                                print('Up-sensor stop; landing')
-                                motion.stop()
-                                break
-                            x0, x1, y0, y1 = GOAL_AREA
-                            if x0 <= pose['x'] <= x1 and y0 <= pose['y'] <= y1:
-                                print('Entered goal area; landing')
-                                motion.stop()
-                                break
-                            vx, vy, yaw_rate = nav.command(pose, ranges[:4], now)
-                            if nav.fault:
-                                print(nav.fault+'; landing')
-                                motion.stop()
-                                break
-                            motion.start_linear_motion(vx, vy, 0., yaw_rate)
-                            with data_lock:
-                                live_state['command'] = (vx, vy, yaw_rate)
-                            diag = slam.diagnostics()
-                            with nav.lock:
-                                state, reason, target = nav.state, nav.reason, nav.target or (None, None)
-                                reached, revision, desired = nav.reached, nav.revision, nav.desired_yaw
-                            history.append({'timestamp (ms)': sample['timestamp'],
-                                            **dict(zip(DIRECTIONS, ranges)),
-                                            **dict(zip(('raw_'+d+'_mm' for d in DIRECTIONS), sample['raw_ranges'])),
-                                            'X': pose['x'], 'Y': pose['y'], 'Yaw': pose['yaw'],
-                                            'raw_X': sample['odom']['x'], 'raw_Y': sample['odom']['y'],
-                                            'raw_Yaw': sample['odom']['yaw'], 'controller_state': state,
-                                            'stop_reason': reason, 'cmd_vx': vx, 'cmd_vy': vy,
-                                            'cmd_yaw_rate': yaw_rate, 'target_X': target[0], 'target_Y': target[1],
-                                            'waypoints_reached': reached, 'plan_revision': revision,
-                                            'desired_yaw': desired, **diag})
-                            if now-last_print > 2.:
-                                print(f"{state}: XY=({pose['x']:.2f}, {pose['y']:.2f}), "
-                                      f"waypoints={reached}, SLAM={diag['slam_state']}, reason={reason}")
-                                last_print = now
-                            time.sleep(max(.001, .02-(time.monotonic()-now)))
-                    finally:
-                        with data_lock:
-                            live_state.update(command=(0., 0., 0.), phase='LANDING')
-            finally:
-                stop.set()
-                if thread:
-                    thread.join(timeout=3.)
-                log.stop()
-                with data_lock:
-                    live_state['phase'] = 'FINISHED'
-    finally:
-        if plotter is not None:
-            plotter.close()
-        save_rows(output, history)            # Save useful diagnostics even after an error.
-        np.savez_compressed('occupancy_map.npz', grid=grid.grid, resolution=grid.resolution,
-                            bounds=[grid.x_min, grid.x_max, grid.y_min, grid.y_max])
-        print('Saved '+output+' and occupancy_map.npz' if history else 'No flight rows; saved occupancy_map.npz')
+            # MotionCommander takes off on enter (resetting the estimator) and lands on exit,
+            # including on exceptions and Ctrl+C.
+            with MotionCommander(scf, default_height=HEIGHT) as motion:
+                motion.start_linear_motion(0., 0., 0., 0.)
+                time.sleep(1.5)
+                frame = Frame(fresh_sample(time.monotonic())['odom'])
+                print(f'Airborne. Flying {START} -> {GOAL}')
+                start = last_print = height_ok = time.monotonic()
+                while True:
+                    now = time.monotonic()
+                    s = sample()
+                    if now - s['received'] > .5:
+                        result = 'telemetry lost'; break
+                    if now - start > MISSION_SECONDS:
+                        result = 'mission time limit'; break
+                    if math.isfinite(s['ranges'][4]) and s['ranges'][4] < .2:
+                        result = 'object above the drone'; break
+                    height = s['ranges'][5]
+                    if math.isfinite(height) and abs(height-HEIGHT) < HEIGHT_TOLERANCE:
+                        height_ok = now
+                    if now - height_ok > HEIGHT_SECONDS:
+                        result = f'height lost (z-range {height:.2f} m, wanted {HEIGHT:.2f} m)'; break
+                    x, y, yaw = frame.pose(s['odom'])
+                    command = nav.step(x, y, yaw, s['ranges'][:4], now)
+                    if nav.done:
+                        result = 'goal reached'; break
+                    if nav.fault:
+                        result = nav.fault; break
+                    motion.start_linear_motion(command[0], command[1], 0., command[2])
+                    distance = math.dist((x, y), GOAL)
+                    log.writerow({'time': now-start, 'state': nav.state, 'reason': nav.reason,
+                                  'x': x, 'y': y, 'yaw': yaw,
+                                  **dict(zip(('odom_x', 'odom_y', 'odom_yaw'), s['odom'])),
+                                  **dict(zip(DIRECTIONS, s['ranges'])),
+                                  **dict(zip(('cmd_vx', 'cmd_vy', 'cmd_yaw_rate'), command)),
+                                  'heading': math.degrees(nav.heading or 0.), 'free': nav.free,
+                                  'goal_distance': distance})
+                    if now - last_print > 1.:
+                        print(f'{nav.state:9s} ({x:5.2f}, {y:5.2f}) yaw {yaw:6.1f}  '
+                              f'{distance:.2f} m to goal  {nav.reason}')
+                        last_print = now
+                    time.sleep(max(0., .05-(time.monotonic()-now)))
+                motion.stop()
+                print('Landing:', result)
+        except KeyboardInterrupt:
+            result = 'interrupted'
+            print('Interrupted; landing')
+        finally:
+            config.stop()
+            log.writerow({'state': 'END', 'reason': result})
+    return result
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('uri', nargs='?', default=DEFAULT_URI)
-    parser.add_argument('--turn-every', type=int, default=TURN_EVERY_WAYPOINTS,
-                        help='Rotate in place every N reached waypoints (positive integer)')
-    parser.add_argument('--no-plot', action='store_true', help='Disable the live dashboard')
-    parser.add_argument('--plot-hz', type=float, default=5., help='Dashboard refresh rate (default: 5 Hz)')
-    parser.add_argument('--replay', help='Existing CSV; no drone/radio connection')
-    parser.add_argument('--output', default='flight_log_slam.csv')
+    parser.add_argument('--goal', nargs=2, type=float, metavar=('X', 'Y'))
+    parser.add_argument('--start', nargs=2, type=float, metavar=('X', 'Y'))
+    parser.add_argument('--height', type=float)
+    parser.add_argument('--arena', nargs=4, type=float, metavar=('X_MIN', 'X_MAX', 'Y_MIN', 'Y_MAX'),
+                        help='virtual fence in map meters (default: none)')
+    parser.add_argument('--output', default=datetime.now().strftime('flight_log_%Y%m%d_%H%M%S.csv'))
     args = parser.parse_args()
-    if not math.isfinite(args.plot_hz) or not 0. < args.plot_hz <= 30.:
-        parser.error("--plot-hz must be greater than 0 and at most 30")
-    if args.turn_every < 1:
-        parser.error("--turn-every must be at least 1")
-    if args.replay:
-        replay(args.replay, args.output)
-    else:
-        fly(args.uri, args.output, turn_every=args.turn_every,
-            show_plot=not args.no_plot, plot_hz=args.plot_hz)
+    if args.goal: GOAL = tuple(args.goal)
+    if args.start: START = tuple(args.start)
+    if args.height: HEIGHT = args.height
+    if args.arena: ARENA = tuple(args.arena)
+    outcome = fly(args.uri, args.output)
+    print('Result:', outcome, '| log:', args.output)
+    try:
+        from plotter import plot_flight
+        print('Plot:', plot_flight(args.output, GOAL))
+    except Exception as error:
+        print('Plot failed:', error)
+    raise SystemExit(0 if outcome == 'goal reached' else 1)

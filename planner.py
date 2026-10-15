@@ -1,248 +1,376 @@
-"""Stable global route + continuous, drift-tolerant velocity following."""
+"""Point-A-to-point-B navigation for a Crazyflie with Flow + Multi-ranger decks.
+
+The drone never turns and translates at the same time; in flight that smeared the
+ranger map by 20-50 cm and bent the actual direction of travel by up to 40 degrees.
+  SCAN   Hover and turn slowly to +45, -45 and back to 0 degrees. The four beams are
+         90 degrees apart, so this sees in every direction.
+  MOVE   Hold the nose at 0 degrees and fly up to SCAN_EVERY meters, then BRAKE (fixed
+         time) and SCAN again. Rescan early when the planned direction is blocked.
+Every step:
+  - Ranger hits become obstacle points in the map frame (short-term memory).
+  - A* plans on a 5 cm grid from those points (unknown space counts as free). It keeps
+    MIN_CLEARANCE as a hard limit and prefers CLEARANCE and more, so it fits ~60 cm doors
+    and flies down their middle. The current path is kept until it is blocked or a
+    clearly cheaper one appears. The drone flies straight at the goal when the whole
+    line is clear with CLEARANCE, otherwise toward a point 40 cm along the path.
+  - The chosen heading must have a corridor free of remembered points.
+  - A body-frame guard limits velocity toward any beam that reads closer than CLEARANCE
+    and backs away inside it. It uses raw ranges, so it works even if odometry is wrong.
+  - Position jumps (collision or estimator failure) end the flight.
+"""
 import heapq
 import math
-import threading
-import time
-from slam import CLEARANCE, wrap
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+DRONE_RADIUS = 0.10
+CLEARANCE = 0.25          # Preferred distance from drone center to an obstacle (open space, guard).
+MIN_CLEARANCE = 0.18      # Hard minimum, used only where needed (doors): ~60 cm openings fit.
+FAR_CLEARANCE = 0.12      # Hard minimum for planning around points farther than NEAR_POINTS:
+NEAR_POINTS = 0.80        # the ranger cone smears far edges ~10 cm into openings.
+MAX_SPEED = 0.20          # m/s
+LOOKAHEAD = 1.0           # Corridor length checked per heading, m.
+MIN_FREE = 0.10           # A heading needs at least this much free corridor, m.
+PREFERRED_FREE = 0.30     # Headings with this much free corridor are preferred.
+GOAL_TOLERANCE = 0.08     # m
+SCAN_EVERY = 1.00         # Rescan after flying this far, m.
+SCAN_ANGLES = (45., -45., 0.)
+SCAN_RATE = 60.           # deg/s, slow enough that ranger lag barely smears the map.
+BRAKE_SECONDS = 0.8       # Zero velocity before each scan.
+RANGE_AGE = 0.10          # s; rangers lag the pose by about this much.
+GUARD_GAIN = 1.0          # 1/s; allowed speed toward a beam = gain*(range - CLEARANCE).
+MAX_PUSH = 0.15           # Fastest back-away speed of the guard, m/s.
+MAX_POSE_JUMP = 0.10      # m between 20 Hz samples; more means the estimate broke.
+SENSOR_ANGLES = (0., 180., 90., -90.)  # front, back, left, right (body frame, degrees)
+MEMORY_RANGE = 1.5        # Hits farther than this are not stored.
+MEMORY_SECONDS = 90.      # Forget points after this. Shorter makes long flights re-explore dead ends.
+CELL = 0.03               # One remembered point per 3 cm cell.
+HEADINGS = np.radians(np.arange(-180., 180., 10.))
+GRID = 0.05               # Planning grid cell size, m.
+REPLAN_SECONDS = 0.25
+PATH_LOOKAHEAD = 0.40     # Steer toward the path point this far ahead, m.
+SWITCH_RATIO = 1.25       # Keep the current path unless a new one is this much cheaper.
+CONE = math.radians(2.)   # Half-angle treated as seen-through in front of a reading.
+NEIGHBORS = [(dx, dy, math.hypot(dx, dy)) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
 
 
-def projection(p, a, b):
-    """Progress along an edge, and sideways distance from its supporting line."""
-    dx, dy = b[0]-a[0], b[1]-a[1]
-    length = math.hypot(dx, dy)
-    if length < 1e-9:
-        return 1., math.dist(p, b)
-    t = ((p[0]-a[0])*dx+(p[1]-a[1])*dy)/length**2
-    return t, abs((p[0]-a[0])*dy-(p[1]-a[1])*dx)/length
+def wrap(degrees):
+    return (degrees + 180.) % 360. - 180.
 
 
-def plan_route(start, goal, grid):
-    """A* over the inflated occupancy grid; unknown cells remain traversable."""
-    blocked = grid.costmap()
-    def valid(cell):
-        c, r = cell
-        return 0 <= c < grid.cols and 0 <= r < grid.rows and not blocked[c, r]
-    def clear(a, b):
-        return grid.segment_clear(a, b, blocked)
-    source, target = grid.world_to_grid(*start), grid.world_to_grid(*goal)
-    if not valid(source) or not valid(target):
-        return []
-    if clear(start, goal):
-        points = [start, goal]
-    else:
-        heap, costs, parents = [(math.dist(source, target), 0., source)], {source: 0.}, {}
-        neighbors = [(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1) if x or y]
-        while heap:
-            _, cost, cell = heapq.heappop(heap)
-            if cost > costs[cell]:
+def plan_path(start, goal, points, bounds, previous=None):
+    """A* on a GRID-sized grid; unknown space counts as free.
+
+    `previous` (the path being flown) is kept while it stays unblocked and costs less
+    than SWITCH_RATIO times the new path: replanning from scratch every 0.25 s flips
+    between near-equal routes and the drone dithers in place.
+
+    Cells closer than MIN_CLEARANCE to an obstacle point or the bounds are blocked, and
+    cells closer than CLEARANCE + 25 cm cost more, so paths keep a wide margin where
+    there is room and run down the middle of narrow openings. Points farther than
+    NEAR_POINTS from the start only block within FAR_CLEARANCE: far door edges are
+    measured too wide, and they are re-measured on approach. A drone that drifted
+    into a blocked cell may still leave it toward more clearance. Returns world
+    waypoints from start to goal, or None when the goal is unreachable.
+    """
+    x0, x1, y0, y1 = bounds
+    nx, ny = math.ceil((x1-x0)/GRID), math.ceil((y1-y0)/GRID)
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+
+    def distance_to(subset):
+        occupied = np.zeros((nx, ny), bool)
+        cells = np.floor((subset - (x0, y0))/GRID).astype(int)
+        inside = (cells[:, 0] >= 0) & (cells[:, 0] < nx) & (cells[:, 1] >= 0) & (cells[:, 1] < ny)
+        occupied[cells[inside, 0], cells[inside, 1]] = True
+        return distance_transform_edt(~occupied)*GRID if occupied.any() else np.full((nx, ny), np.inf)
+    near = np.hypot(*(points - start).T) < NEAR_POINTS
+    near_clearance, far_clearance = distance_to(points[near]), distance_to(points[~near])
+    cx, cy = x0 + (np.arange(nx)+.5)*GRID, y0 + (np.arange(ny)+.5)*GRID
+    edge = np.minimum.outer(np.minimum(cx-x0, x1-cx), np.minimum(cy-y0, y1-cy))
+    clearance = np.minimum(np.minimum(near_clearance, far_clearance), edge)
+    blocked = (np.minimum(near_clearance, edge) < MIN_CLEARANCE) | (far_clearance < FAR_CLEARANCE)
+    penalty = 1. + 3.*np.clip((CLEARANCE + .25 - clearance)/.25, 0., 1.) \
+        + 5.*np.clip((CLEARANCE - clearance)/(CLEARANCE - MIN_CLEARANCE), 0., 1.)
+
+    def cell(p):
+        return (min(nx-1, max(0, int((p[0]-x0)/GRID))), min(ny-1, max(0, int((p[1]-y0)/GRID))))
+    source, target = cell(start), cell(goal)
+    if blocked[target]:
+        return None
+    cost, parent = {source: 0.}, {source: None}
+    heap = [(0., 0., source)]
+    while heap:
+        _, g, current = heapq.heappop(heap)
+        if current == target:
+            break
+        if g > cost[current]:
+            continue
+        for dx, dy, step in NEIGHBORS:
+            n = (current[0]+dx, current[1]+dy)
+            if not (0 <= n[0] < nx and 0 <= n[1] < ny):
                 continue
-            if cell == target:
-                break
-            for dx, dy in neighbors:
-                nxt = (cell[0]+dx, cell[1]+dy)
-                if not valid(nxt):
-                    continue
-                if dx and dy and (not valid((cell[0]+dx, cell[1])) or
-                                  not valid((cell[0], cell[1]+dy))):
-                    continue
-                new = cost+math.hypot(dx, dy)
-                if new < costs.get(nxt, float('inf')):
-                    costs[nxt], parents[nxt] = new, cell
-                    heapq.heappush(heap, (new+math.dist(nxt, target), new, nxt))
-        if target not in costs:
-            return []
-        cells, cell = [target], target
-        while cell != source:
-            cell = parents[cell]
-            cells.append(cell)
-        points = [start]+[grid.grid_to_world(*c) for c in reversed(cells)][1:-1]+[goal]
-        # Remove redundant cell-by-cell dots without cutting obstacle corners.
-        simple, index = [start], 0
-        while index < len(points)-1:
-            nxt = len(points)-1
-            while nxt > index+1 and not clear(points[index], points[nxt]):
-                nxt -= 1
-            if not clear(points[index], points[nxt]):
-                return []
-            simple.append(points[nxt])
-            index = nxt
-        points = simple
-    route = [start]
-    for a, b in zip(points, points[1:]):
-        count = max(1, math.ceil(math.dist(a, b)/.40))
-        route.extend((a[0]+(b[0]-a[0])*i/count, a[1]+(b[1]-a[1])*i/count)
-                     for i in range(1, count+1))
-    return route
+            if blocked[n] and not (blocked[current] and clearance[n] > clearance[current]):
+                continue
+            new = g + step*penalty[n]
+            if new < cost.get(n, math.inf):
+                cost[n], parent[n] = new, current
+                heapq.heappush(heap, (new + math.hypot(n[0]-target[0], n[1]-target[1]), new, n))
+    if target not in parent:
+        return None
+    path, c = [], target
+    while c is not None:
+        path.append((x0 + (c[0]+.5)*GRID, y0 + (c[1]+.5)*GRID))
+        c = parent[c]
+    path.reverse()
+    path = [tuple(start)] + path[1:-1] + [tuple(goal)]
+    if previous:
+        # Rejoin the old path at its closest point and price it on the new map.
+        i = min(range(len(previous)), key=lambda k: math.dist(start, previous[k]))
+        old = [tuple(start)] + list(previous[i+1:])
+        old_cost = 0.
+        for a, b in zip(old, old[1:]):
+            n = max(1, math.ceil(math.dist(a, b)/(GRID/2)))
+            for k in range(1, n+1):
+                c = cell((a[0]+(b[0]-a[0])*k/n, a[1]+(b[1]-a[1])*k/n))
+                if blocked[c] and math.dist(start, a) > 2*GRID:
+                    return path
+                old_cost += math.dist(a, b)/n/GRID*penalty[c]
+        if old_cost < SWITCH_RATIO*cost[target]:
+            return old
+    return path
+
+
+def guard(vx, vy, ranges):
+    """Limit body velocity using the raw ranges: slow toward close beams, back away inside CLEARANCE."""
+    front, back, left, right = ranges
+    limit = lambda r: math.inf if not math.isfinite(r) else max(-MAX_PUSH, GUARD_GAIN*(r - CLEARANCE))
+    hi_x, lo_x = limit(front), -limit(back)
+    hi_y, lo_y = limit(left), -limit(right)
+    vx = (hi_x+lo_x)/2 if lo_x > hi_x else min(hi_x, max(lo_x, vx))
+    vy = (hi_y+lo_y)/2 if lo_y > hi_y else min(hi_y, max(lo_y, vy))
+    return vx, vy
 
 
 class Navigator:
-    def __init__(self, grid, goal, turn_every=3):
-        self.grid, self.goal = grid, goal
-        if not isinstance(turn_every, int) or isinstance(turn_every, bool) or turn_every < 1:
-            raise ValueError("turn_every must be a positive integer")
-        self.cruise_speed = .25
-        self.lookahead, self.arrival_tolerance, self.pass_corridor = .55, .15, .30
-        self.turn_every, self.max_yaw_rate = turn_every, 45.
-        self.yaw_tolerance = 3.  # Resume translation once the scheduled turn is within 3 degrees.
-        self.lock = threading.Lock()
-        self.route, self.index, self.revision = [], 1, 0
-        self.reached, self.pending_turns, self.turn_sign = 0, 0, 1
-        self.desired_yaw, self.turn_started = None, None
-        self.state, self.reason, self.target, self.fault = 'WAIT_PATH', '', None, None
-        self.last_plan, self.no_path_since = -float('inf'), None
-        self.progress_anchor, self.progress_time = None, None
+    def __init__(self, goal, arena=None):
+        """goal: (x, y) in meters. arena: optional (x_min, x_max, y_min, y_max) virtual fence."""
+        self.goal = (float(goal[0]), float(goal[1]))
+        self.arena = self.bounds = arena
+        self.points = {}               # cell -> (x, y, time)
+        self.last_ranges = (math.nan,)*4
+        self.last_pose = None          # (x, y, yaw, time)
+        self.heading = None            # Chosen travel heading, radians.
+        self.path, self.planned_at = None, -math.inf
+        self.no_path_since = self.stuck_since = self.arrived_since = None
+        self.state, self.reason, self.fault = 'BRAKE', 'startup', None
+        self.phase_start, self.scan_targets, self.scan_xy = None, [], None
+        self.done = False
+        self.free = float('nan')
+        self.best_distance, self.progress_time = math.inf, None
 
-    def update_route(self, pose, now=None):
-        """Worker call. Preserve the route unless blocked or substantially off it."""
-        now = time.monotonic() if now is None else now
-        if now-self.last_plan < .7:
-            return
-        p, blocked = (pose['x'], pose['y']), self.grid.costmap()
-        with self.lock:
-            if self.turn_started is not None:
-                return  # Keep waypoint identities stable during an in-place turn.
-            route, index, revision = list(self.route), self.index, self.revision
-        replace = len(route) < 2
-        if index < len(route):
-            t, cross = projection(p, route[index-1], route[index])
-            deviation = cross if 0 <= t <= 1 else math.dist(p, route[index-1] if t < 0 else route[index])
-            remaining = [p]+route[index:]
-            replace |= deviation > .45 or any(not self.grid.segment_clear(a, b, blocked)
-                                             for a, b in zip(remaining, remaining[1:]))
-        if replace:
-            new_route = plan_route(p, self.goal, self.grid)
-            with self.lock:
-                if revision == self.revision and self.turn_started is None:
-                    self.route, self.index = new_route, 1
-                    self.revision += 1
-        self.last_plan = now
+    # ---------------------------------------------------------------- mapping
+    def observe(self, x, y, yaw, ranges, now):
+        """ranges: (front, back, left, right) in meters, NaN when there is no valid return.
 
-    @staticmethod
-    def velocity_limit(distance):
-        """Limit only the component toward a nearby surface. Unknown: creep speed.
-        Model: v*reaction_time + v²/(2*deceleration) <= surface_range-clearance.
+        Only beams whose value changed are used: the rangers refresh slower than the log,
+        and a held old value paired with a newer pose would be misplaced.
         """
-        if distance is None or not math.isfinite(distance) or distance <= 0:
-            return .05
-        room = max(0., distance-CLEARANCE)
-        acceleration, delay = .4, .20
-        return max(0., math.sqrt((acceleration*delay)**2+2*acceleration*room)-acceleration*delay)
+        fresh = [math.isfinite(r) and r != old for r, old in zip(ranges, self.last_ranges)]
+        self.last_ranges = tuple(ranges)
+        if self.points:
+            keys = list(self.points)
+            xy = np.array([self.points[k][:2] for k in keys])
+            stamps = np.array([self.points[k][2] for k in keys])
+            remove = now - stamps > MEMORY_SECONDS
+            for r, offset, new in zip(ranges, SENSOR_ANGLES, fresh):
+                if not new or r < .05:
+                    continue
+                a = math.radians(yaw + offset)
+                ux, uy = math.cos(a), math.sin(a)
+                rel = xy - (x, y)
+                along = rel[:, 0]*ux + rel[:, 1]*uy
+                perp = np.abs(rel[:, 1]*ux - rel[:, 0]*uy)
+                # The ranger reports the nearest target in its cone, so nothing is in
+                # front of the reading. The cone used here is much narrower than the
+                # real one, so a beam grazing past a thin pole does not erase it, but it
+                # erases far door edges that the cone smeared into the opening.
+                remove |= (along > .05) & (along < min(r, MEMORY_RANGE) - .08) \
+                    & (perp < .015 + along*math.tan(CONE))
+            for key in np.asarray(keys, dtype=object)[remove]:
+                del self.points[tuple(key)]
+        for r, offset, new in zip(ranges, SENSOR_ANGLES, fresh):
+            if new and .05 <= r <= MEMORY_RANGE:
+                a = math.radians(yaw + offset)
+                px, py = x + r*math.cos(a), y + r*math.sin(a)
+                self.points[(math.floor(px/CELL), math.floor(py/CELL))] = (px, py, now)
 
-    def command(self, pose, ranges, now=None):
-        now = time.monotonic() if now is None else now
-        # The worker can replace the route only between complete command updates.
-        with self.lock:
-            return self._command(pose, ranges, now)
+    def obstacle_points(self):
+        return np.array([v[:2] for v in self.points.values()]).reshape(-1, 2)
 
-    def _rotation_command(self, yaw, now):
-        """Return yaw-only motion, or None when this scheduled turn is complete."""
-        error = wrap(self.desired_yaw-yaw)
-        if abs(error) <= self.yaw_tolerance:
-            self.turn_started = None
-            return None
-        if now-self.turn_started > 8.:
-            self.fault = 'Yaw turn timed out'
-            return 0., 0., 0.
-        self.state, self.reason = 'ROTATING', 'scheduled_turn'
-        rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, 2.*error))
-        return 0., 0., rate  # Never send translation while rotating.
+    # ------------------------------------------------------------- planning
+    def free_distance(self, x, y, headings, clearance=CLEARANCE, length=LOOKAHEAD):
+        """How far (up to `length`) the drone center can travel along each heading keeping `clearance`."""
+        headings = np.asarray(headings, dtype=float)
+        free = np.full(headings.shape, length)
+        ux, uy = np.cos(headings), np.sin(headings)
+        pts = self.obstacle_points()
+        if len(pts):
+            rel = pts - (x, y)
+            along = np.outer(ux, rel[:, 0]) + np.outer(uy, rel[:, 1])
+            perp = np.abs(np.outer(ux, rel[:, 1]) - np.outer(uy, rel[:, 0]))
+            hit = (perp < clearance) & (along >= 0.)
+            entry = along - np.sqrt(np.maximum(0., clearance**2 - perp**2))
+            free = np.minimum(free, np.where(hit, entry, np.inf).min(axis=1))
+        if self.arena is not None:
+            x0, x1, y0, y1 = self.arena
+            m = clearance
+            with np.errstate(divide='ignore', invalid='ignore'):
+                for u, p, lo, hi in ((ux, x, x0+m, x1-m), (uy, y, y0+m, y1-m)):
+                    limit = np.where(u > 1e-9, (hi-p)/u, np.where(u < -1e-9, (lo-p)/u, np.inf))
+                    free = np.minimum(free, np.maximum(limit, 0.))
+        return free
 
-    def _command(self, pose, ranges, now):
+    def path_heading(self, x, y):
+        """Heading toward the path point PATH_LOOKAHEAD ahead of the closest path point."""
+        path = self.path
+        i = min(range(len(path)), key=lambda k: math.dist((x, y), path[k]))
+        target, remaining = path[i], PATH_LOOKAHEAD
+        for a, b in zip(path[i:], path[i+1:]):
+            step = math.dist(a, b)
+            target = b
+            if step >= remaining:
+                target = (a[0]+(b[0]-a[0])*remaining/step, a[1]+(b[1]-a[1])*remaining/step)
+                break
+            remaining -= step
+        return math.atan2(target[1]-y, target[0]-x)
+
+    # --------------------------------------------------------------- control
+    def _brake(self, now, reason):
+        self.state, self.reason, self.phase_start = 'BRAKE', reason, now
+
+    def _hold_yaw(self, yaw, check=True):
+        if check and abs(yaw) > 30.:
+            self.fault = f'Yaw drifted to {yaw:.0f} deg while holding 0 (yaw rate sign or estimator problem)'
+        return max(-20., min(20., -2.*yaw))
+
+    def _output(self, vx, vy, yaw_rate, ranges):
         if self.fault:
             return 0., 0., 0.
-        p = (pose['x'], pose['y'])
-        yaw = pose['yaw']
-        if not all(math.isfinite(v) for v in (*p, yaw)):
-            self.fault = 'Invalid pose'
+        vx, vy = guard(vx, vy, ranges)
+        return vx, vy, yaw_rate
+
+    def step(self, x, y, yaw, ranges, now):
+        """Return body-frame (vx, vy, yaw_rate) for MotionCommander.start_linear_motion.
+
+        x, y in meters and yaw in degrees, all in the map frame (yaw 0 = start heading).
+        """
+        if self.fault or self.done:
             return 0., 0., 0.
-        # Watch real odometry displacement, not changes caused by SLAM corrections.
-        odom = (pose.get('odom_x', p[0]), pose.get('odom_y', p[1]))
-        if self.desired_yaw is None:
-            self.desired_yaw = yaw
-            self.progress_anchor, self.progress_time = odom, now
-        if self.turn_started is not None:
-            rotation = self._rotation_command(yaw, now)
-            if rotation is not None:
-                return rotation  # Do not count waypoints or chase XY drift during yaw.
-            # Rotation is intentionally stationary; restart the progress watchdog.
-            self.progress_anchor, self.progress_time = odom, now
-        if len(self.route) < 2:
-            self.state, self.reason = 'WAIT_PATH', 'no_route'
-            self.no_path_since = now if self.no_path_since is None else self.no_path_since
-            if now-self.no_path_since > 10.:
-                self.fault = 'No map route for 10 seconds'
-            return 0., 0., 0.
-        self.no_path_since = None
-        while self.index < len(self.route):
-            t, cross = projection(p, self.route[self.index-1], self.route[self.index])
-            if not (math.dist(p, self.route[self.index]) <= self.arrival_tolerance or
-                    (self.index < len(self.route)-1 and t >= 1. and cross <= self.pass_corridor)):
-                break
-            self.index += 1
-            self.reached += 1
-            if self.reached % self.turn_every == 0:
-                self.pending_turns += 1
-        if self.index == len(self.route):
-            self.state, self.reason = 'PATH_END', 'route_complete'
-            return 0., 0., 0.
-        if self.pending_turns:
-            self.desired_yaw = wrap(self.desired_yaw+90.*self.turn_sign)
-            self.turn_sign *= -1
-            self.pending_turns -= 1
-            self.turn_started = now
-            rotation = self._rotation_command(yaw, now)
-            if rotation is not None:
-                return rotation
-            self.progress_anchor, self.progress_time = odom, now
-        # Between scheduled turns, yaw rate is zero as well. Translation and yaw
-        # commands never overlap, including the final few degrees of alignment.
-        yaw_rate = 0.
-        # Aim ahead, instead of stopping to center over each dot.
-        a, b = self.route[self.index-1], self.route[self.index]
-        t, _ = projection(p, a, b)
-        t = min(1., max(0., t))
-        cursor = (a[0]+t*(b[0]-a[0]), a[1]+t*(b[1]-a[1]))
-        remaining, target = self.lookahead, b
-        for point in self.route[self.index:]:
-            distance = math.dist(cursor, point)
-            if distance >= remaining and distance > 1e-9:
-                target = (cursor[0]+(point[0]-cursor[0])*remaining/distance,
-                          cursor[1]+(point[1]-cursor[1])*remaining/distance)
-                break
-            remaining -= distance
-            cursor = target = point
-        blocked = self.grid.costmap()
-        if not self.grid.segment_clear(p, target, blocked):
-            target = b                    # Shorten lookahead to avoid cutting a corner.
-        self.target = target
-        dx, dy = target[0]-p[0], target[1]-p[1]
+        yaw_rate_now = 0.
+        if self.last_pose is not None:
+            px, py, pyaw, pt = self.last_pose
+            if math.dist((x, y), (px, py)) > MAX_POSE_JUMP:
+                self.fault = 'Position estimate jumped (collision or Flow-deck failure)'
+                return 0., 0., 0.
+            if now > pt:
+                yaw_rate_now = wrap(yaw - pyaw)/(now - pt)
+        self.last_pose = (x, y, yaw, now)
+        self.observe(x, y, yaw - yaw_rate_now*RANGE_AGE, ranges, now)
+        if self.phase_start is None:
+            self.phase_start = now
+
+        dx, dy = self.goal[0]-x, self.goal[1]-y
         distance = math.hypot(dx, dy)
-        if distance < 1e-9:
-            return 0., 0., yaw_rate
-        speed = self.cruise_speed
-        speed = min(speed, max(.05, 1.2*math.dist(p, self.goal)))
-        wx, wy = speed*dx/distance, speed*dy/distance
-        # MotionCommander takes BODY velocities: +X forward, +Y left.
-        angle = math.radians(yaw)
-        c, s = math.cos(angle), math.sin(angle)
-        bx, by = wx*c+wy*s, -wx*s+wy*c
-        front, back, left, right = ranges
-        bx = max(-self.velocity_limit(back), min(self.velocity_limit(front), bx))
-        by = max(-self.velocity_limit(right), min(self.velocity_limit(left), by))
-        # Check the combined velocity too; separate axes must not cut a mapped corner.
-        wx, wy = bx*c-by*s, bx*s+by*c
-        self.reason = 'clear'
-        if not self.grid.segment_clear(p, (p[0]+.35*wx, p[1]+.35*wy), blocked):
-            bx = by = 0.
-            self.reason = 'map_blocks_motion'
-        elif math.hypot(bx, by) < .01:
-            self.reason = 'range_blocks_motion'
-        self.state = 'NAVIGATING'
-        if math.hypot(bx, by) < .01:
-            self.state = 'BLOCKED'
-        if math.dist(odom, self.progress_anchor) >= .08:
-            self.progress_anchor, self.progress_time = odom, now
-        elif now-self.progress_time > 12.:
-            self.fault = 'No odometry displacement for 12 seconds'
+        if distance < self.best_distance - .05 or self.progress_time is None:
+            self.best_distance, self.progress_time = distance, now
+        if now - self.progress_time > 60.:
+            self.fault = 'No progress toward goal for 60 s'
             return 0., 0., 0.
-        return bx, by, yaw_rate
+
+        # Arrival: settle inside the tolerance for one second, then report done.
+        if distance < GOAL_TOLERANCE or (self.arrived_since is not None and distance < 2*GOAL_TOLERANCE):
+            self.arrived_since = now if self.arrived_since is None else self.arrived_since
+            self.state, self.reason = 'ARRIVING', 'holding at goal'
+            if now - self.arrived_since >= 1.:
+                self.state, self.done = 'ARRIVED', True
+            # Arrival can interrupt a scan, so turn back to 0 without the yaw-drift check.
+            return self._output(0., 0., self._hold_yaw(yaw, check=False), ranges)
+        self.arrived_since = None
+
+        if self.state == 'BRAKE':
+            if now - self.phase_start >= BRAKE_SECONDS:
+                self.state, self.phase_start, self.scan_targets = 'SCAN', now, list(SCAN_ANGLES)
+            return self._output(0., 0., 0., ranges)
+
+        if self.state == 'SCAN':
+            error = wrap(self.scan_targets[0] - yaw)
+            if abs(error) < 4.:
+                self.scan_targets.pop(0)
+                self.phase_start = now
+                if not self.scan_targets:
+                    self.state, self.scan_xy, self.planned_at = 'MOVE', (x, y), -math.inf
+                    return self._output(0., 0., 0., ranges)
+                error = wrap(self.scan_targets[0] - yaw)
+            if abs(yaw) > 90. or now - self.phase_start > 6.:
+                self.fault = 'Yaw does not follow scan commands (yaw rate sign or estimator problem)'
+                return 0., 0., 0.
+            self.reason = f'turning to {self.scan_targets[0]:.0f} deg'
+            return self._output(0., 0., max(-SCAN_RATE, min(SCAN_RATE, 4.*error)), ranges)
+
+        # MOVE: hold yaw at 0 and translate.
+        yaw_rate = self._hold_yaw(yaw)
+        if self.fault:
+            return 0., 0., 0.
+        if self.bounds is None:
+            m = 1.5
+            self.bounds = (min(x, self.goal[0])-m, max(x, self.goal[0])+m,
+                           min(y, self.goal[1])-m, max(y, self.goal[1])+m)
+        if now - self.planned_at >= REPLAN_SECONDS:
+            self.path = plan_path((x, y), self.goal, self.obstacle_points(), self.bounds, self.path)
+            self.planned_at = now
+            self.no_path_since = None if self.path else (self.no_path_since or now)
+        if self.no_path_since is not None and now - self.no_path_since > 10.:
+            self.fault = 'No path to the goal for 10 s (blocked, or goal too close to an obstacle)'
+            return 0., 0., 0.
+        goal_heading = math.atan2(dy, dx)
+        # Only fly straight when the whole line to the goal is clear; checking just the next
+        # meter steers into dead ends that the planner then steers out of, every tick.
+        direct = self.free_distance(x, y, [goal_heading], length=distance)[0] >= distance
+        desired = goal_heading if direct or not self.path else self.path_heading(x, y)
+
+        candidates = np.concatenate(([desired], HEADINGS))
+        # The path already keeps CLEARANCE wherever there is room; in a door it runs down
+        # the middle, so following it only needs MIN_CLEARANCE.
+        free = self.free_distance(x, y, candidates, CLEARANCE if direct else MIN_CLEARANCE)
+        # Prefer turning early over creeping up to an obstacle; fall back to tight gaps.
+        roomy = free >= min(PREFERRED_FREE, distance)
+        valid = roomy if roomy.any() else free >= MIN_FREE
+        # The path is the plan; the corridor check is the safety layer on top of it.
+        deviation = np.abs(np.angle(np.exp(1j*(candidates - desired))))
+        deviation[~valid] = np.inf
+        best = int(np.argmin(deviation))
+        travelled = math.dist((x, y), self.scan_xy)
+
+        if not math.isfinite(deviation[best]):
+            if travelled > .2:
+                self._brake(now, 'no free heading; look around')
+                return self._output(0., 0., 0., ranges)
+            self.stuck_since = now if self.stuck_since is None else self.stuck_since
+            self.state, self.reason, self.free = 'STUCK', 'no free heading', 0.
+            if now - self.stuck_since > 10.:
+                self.fault = 'No free heading for 10 s'
+                return 0., 0., 0.
+            return self._output(0., 0., yaw_rate, ranges)
+        self.stuck_since = None
+        if travelled >= SCAN_EVERY or (best and travelled > .2):
+            self._brake(now, 'periodic scan' if travelled >= SCAN_EVERY else 'planned direction blocked')
+            return self._output(0., 0., 0., ranges)
+        self.heading, self.free = float(candidates[best]), float(free[best])
+        self.state = ('BLOCKED' if best else 'DIRECT' if direct else
+                      'DETOUR' if self.path else 'NO_PATH')
+        self.reason = f'heading {math.degrees(self.heading):.0f} deg, {self.free:.2f} m free'
+
+        speed = min(MAX_SPEED, .5*(self.free - .05), .8*distance + .02)
+        wx, wy = speed*math.cos(self.heading), speed*math.sin(self.heading)
+        c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        return self._output(c*wx + s*wy, -s*wx + c*wy, yaw_rate, ranges)
