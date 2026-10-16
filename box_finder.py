@@ -54,10 +54,20 @@ BOX_SIZE = 0.45           # m; largest side of the box (or a bit more). Sets the
 # The dip shrinks with speed because the height controller keeps up better: real searches
 # dipped 8-10 cm at 0.25 m/s but only 3.9-5.6 cm at 0.15 m/s, against floor noise within
 # +/-1.9 cm (0.1 s average).
-ENTER_FRACTION = 0.12     # zrange this far below the hover level: over the box (3.5 cm).
-LEAVE_FRACTION = 0.12     # zrange this far above it, after an enter: off the box (3.5 cm).
+# The 16 cm box at 0.15 m/s dips only 2.3-4 cm below the floor level measured in flight
+# (box log 190123: 2.3 cm for ~0.4 s). Against that level, no search over bare floor in the
+# logs reached 1 cm for ENTER_HOLD, and 2 cm missed 190123.
+ENTER_FRACTION = 0.09     # zrange this far below the floor level: over the box (2.6 cm @ 29 cm box)
+LEAVE_FRACTION = 0.12     # zrange this far above it, after an enter: off the box.
+MIN_LEVEL = 0.015         # m; enter/leave levels are never smaller than this (16 cm box: 1.5 cm).
+ENTER_HOLD = 0.20         # s the dip must stay below MIN_LEVEL to count as an enter.
 SIGNAL_FRACTION = 0.15    # a pass whose profile varies less than this missed the box (4.4 cm).
 SMOOTH = 0.10             # s; average fresh zrange readings over this window.
+# The hover right after takeoff read ~2 cm higher than the same floor in steady flight
+# (0.52 vs 0.50 m), which alone crossed a 2 cm level. So the search measures the floor
+# level while flying, and can't report an enter until that level is known.
+FLOOR_SETTLE = 0.9        # s of search before an enter can count.
+FLOOR_WINDOW = (1.5, 0.4) # floor level = median of search readings from this many s ago to this many.
 SEARCH_DISTANCE = 2.0     # m to fly looking for the box before giving up.
 PASS_SPEED = 0.15         # m/s; search and passes, the same both ways.
 PAST_EDGE = 0.20          # m to fly past a box edge: real profiles settle ~0.4 m after it
@@ -84,11 +94,13 @@ class EdgeDetector:
 
     def __init__(self, height=HEIGHT, box_height=BOX_HEIGHT):
         self.height = height
-        self.enter_level, self.leave_level = ENTER_FRACTION*box_height, LEAVE_FRACTION*box_height
+        self.enter_level = max(MIN_LEVEL, ENTER_FRACTION*box_height)
+        self.leave_level = max(MIN_LEVEL, LEAVE_FRACTION*box_height)
         self.samples = collections.deque()
         self.on_box = False
         self.deviation = 0.
         self.last = None
+        self.below_since = None
 
     def update(self, t, z):
         """Feed one zrange reading (m). Returns 'enter', 'leave' or None."""
@@ -100,7 +112,13 @@ class EdgeDetector:
         while self.samples[0][0] < t - SMOOTH:
             self.samples.popleft()
         self.deviation = sum(v for _, v in self.samples)/len(self.samples) - self.height
-        if not self.on_box and self.deviation < -self.enter_level:
+        # The hold counts from MIN_LEVEL, so a deep box's dip isn't delayed past its own level.
+        if self.deviation < -min(MIN_LEVEL, self.enter_level):
+            self.below_since = t if self.below_since is None else self.below_since
+        else:
+            self.below_since = None
+        if (not self.on_box and self.deviation < -self.enter_level
+                and self.below_since is not None and t - self.below_since >= ENTER_HOLD):
             self.on_box = True
             return 'enter'
         if self.on_box and self.deviation > self.leave_level:
@@ -184,9 +202,18 @@ class BoxFinder:
         and fail if there is none within the search distance."""
         self.state, start, last = ('SEARCH' if search else 'PASS'), self.pos, None
         profile = [] if profile is None else profile
+        began, floor = self.now, []
         while search or (self.pos[0]*u[0] + self.pos[1]*u[1]) < stop:
-            if search and self.event == 'enter':
-                break
+            if search:
+                older = [z for t, z in floor if self.now - FLOOR_WINDOW[0] <= t < self.now - FLOOR_WINDOW[1]]
+                if self.now - began < FLOOR_SETTLE or len(older) < 5:
+                    self.detector.on_box = False
+                elif self.event == 'enter':
+                    break
+                else:
+                    self.detector.height = sorted(older)[len(older)//2]
+                if self.zrange != last and math.isfinite(self.zrange):
+                    floor.append((self.now, self.zrange))
             if search and math.dist(self.pos, start) > self.search_distance:
                 raise Failed(f'no box found within {self.search_distance:.1f} m')
             if self._ahead(u) < WALL_STOP:
@@ -226,6 +253,8 @@ class BoxFinder:
             yield self._toward(self.pos, PASS_SPEED)
         if readings:
             self.detector.height = sorted(readings)[len(readings)//2]
+        # Events during the hover were judged against the default level; start clean.
+        self.detector.on_box = False
         (u, v), start = self.frame, self.pos
         along = lambda p, w: p[0]*w[0] + p[1]*w[1]
 
@@ -235,8 +264,13 @@ class BoxFinder:
         hit = along(self.pos, u)
         self.center = self.pos
         yield from self._pass(u, start, hit + self.box_size + PAST_EDGE, out)
+        # The enter lags the near edge, so the center is past `hit`. With a low box the dip
+        # after leaving it looks like the one onto it, and an unbounded fit paired them
+        # (16 cm box: center 0.37 instead of ~0.6). In odometry the boxes measured up to
+        # ~20% longer than they are, hence the generous far bound.
+        lo, hi = hit + .02, hit + .75*self.box_size
         cu = yield from self._back(u, start, hit - PAST_EDGE, out,
-                                   guess=hit + self.box_size/2 - .1, span=self.box_size/2 + .2)
+                                   guess=(lo + hi)/2, span=(hi - lo)/2)
         cv = along(start, v)
         self.center = (cu*u[0] + cv*v[0], cu*u[1] + cv*v[1])
 

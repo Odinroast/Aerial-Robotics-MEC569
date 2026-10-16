@@ -22,8 +22,10 @@ class Sim:
     - zrange: area average over the 27 degree cone (or the nearest return), 20 Hz,
       1 mm quantized, a few mm of noise.
     """
-    def __init__(self, box, start=(0., 0.), chase=1., nearest=False, bias=0., walls=(), seed=0, drift=0.):
+    def __init__(self, box, start=(0., 0.), chase=1., nearest=False, bias=0., walls=(), seed=0, drift=0.,
+                 hover_bias=0.):
         self.box, self.chase, self.nearest = box, chase, nearest   # box: (cx, cy, length, width, angle_deg)
+        self.hover_bias = hover_bias             # extra zrange while nearly still (real: +2 cm)
         self.drift, self.drift_rng = drift, random.Random(1000 + seed)   # odometry random walk, m/sqrt(s)
         self.walls = list(walls)                 # axis-aligned (x0, x1, y0, y1) at ranger height
         self.wall_clearance = math.inf
@@ -52,7 +54,8 @@ class Sim:
             top = bf.BOX_HEIGHT if any(hits) else 0.
         else:
             top = bf.BOX_HEIGHT*sum(hits)/len(hits)
-        return round(self.z - top + self.bias + self.rng.gauss(0, .005), 3)
+        still = self.hover_bias if math.hypot(self.vx, self.vy) < .05 else 0.
+        return round(self.z - top + self.bias + still + self.rng.gauss(0, .005), 3)
 
     def advance(self, command, dt):
         bx, by, _ = command
@@ -92,7 +95,7 @@ class Sim:
 
 def run(box, seconds=240., box_size=bf.BOX_SIZE, **kw):
     sim = Sim(box, **kw)
-    finder = bf.BoxFinder(box_size=box_size)
+    finder = bf.BoxFinder(box_size=box_size, box_height=bf.BOX_HEIGHT)
     t = 0.
     while t < seconds and not finder.done and not finder.fault:
         x, y = sim.odometry()
@@ -100,6 +103,20 @@ def run(box, seconds=240., box_size=bf.BOX_SIZE, **kw):
         sim.advance(command, .02)
         t += .02
     return finder, sim, t
+
+
+_box_height = bf.BOX_HEIGHT
+
+
+def setUpModule():
+    # These scenarios and their tolerances are for the 29 cm box, whatever box_finder.py
+    # is currently set to fly.
+    global _box_height
+    _box_height, bf.BOX_HEIGHT = bf.BOX_HEIGHT, .29
+
+
+def tearDownModule():
+    bf.BOX_HEIGHT = _box_height
 
 
 class BoxFinderTests(unittest.TestCase):
@@ -165,10 +182,29 @@ class BoxFinderTests(unittest.TestCase):
             self.assertLess(math.dist((sim.x, sim.y), (1.1, -.1)), .05, f'seed {seed}')
             self.assertGreater(sim.wall_clearance, .15, f'seed {seed}')
 
-    def test_box_against_a_wall_fails_with_reason(self):
-        finder, sim, t = run((1.1, -.1, .30, .30, 0.), walls=[(1.55, 1.65, -2., 2.)])
-        self.assertIn('too close', finder.fault)
-        self.assertGreater(sim.wall_clearance, .15)
+    def test_low_box_with_hover_bias(self):
+        # The 16 cm x 45 cm box: dips of only a few cm, and the hover reads 2 cm higher than
+        # steady flight, which used to fire an enter straight away.
+        saved, bf.BOX_HEIGHT = bf.BOX_HEIGHT, .16
+        try:
+            for seed in range(3):
+                finder, sim, t = run((1.0, .1, .45, .45, 0.), box_size=.45, chase=.55,
+                                     hover_bias=.02, seed=seed)
+                self.assertIsNone(finder.fault, f'seed {seed}')
+                self.assertLess(math.dist((sim.x, sim.y), (1.0, .1)), .06, f'seed {seed}')
+        finally:
+            bf.BOX_HEIGHT = saved
+
+    def test_box_against_a_wall_lands_roughly_or_fails_with_reason(self):
+        # The wall cuts the far half of the X pass; either the bounded fit still lands on the
+        # box or it fails and says why.
+        for seed in range(3):
+            finder, sim, t = run((1.1, -.1, .30, .30, 0.), walls=[(1.55, 1.65, -2., 2.)], seed=seed)
+            if finder.fault:
+                self.assertIn('too close', finder.fault)
+            else:
+                self.assertLess(math.dist((sim.x, sim.y), (1.1, -.1)), .08, f'seed {seed}')
+            self.assertGreater(sim.wall_clearance, .15)
 
     def test_wall_ahead_without_box_stops_search(self):
         finder, sim, t = run((5., 5., .3, .3, 0.), walls=[(1.2, 1.3, -2., 2.)])
@@ -199,7 +235,7 @@ class BoxFinderTests(unittest.TestCase):
         log = Path(__file__).with_name('flight_log.csv')
         if not log.exists():
             self.skipTest('flight_log.csv not present')
-        events = bf.replay(str(log), plot=False)
+        events = bf.replay(str(log), box_height=bf.BOX_HEIGHT, plot=False)
         kinds = [e for _, e in events]
         self.assertGreaterEqual(len(kinds), 10)
         self.assertEqual(kinds[0], 'enter')
@@ -211,7 +247,7 @@ class BoxFinderTests(unittest.TestCase):
         log = Path(__file__).with_name('box_log_20261015_111352.csv')
         if not log.exists():
             self.skipTest('box_log_20261015_111352.csv not present')
-        events = bf.replay(str(log), plot=False)
+        events = bf.replay(str(log), box_height=bf.BOX_HEIGHT, plot=False)
         self.assertGreaterEqual(len(events), 2)
         self.assertEqual(events[0][1], 'enter')
         self.assertAlmostEqual(events[0][0], 4.0, delta=.2)

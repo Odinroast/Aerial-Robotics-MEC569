@@ -45,13 +45,13 @@ def fly_leg(field, leg, anchor, seconds=m.LEG_SECONDS):
     return t
 
 
-def mission(box1, box2, start, goal, sweep=(-1., 1.), drift=0., seed=0, box_size=.4, **kw):
+def mission(box1, box2, start, goal, sweep=(-1., 1.), drift=0., seed=0, box_size=.4, walls=(), **kw):
     """Both legs; returns [(leg, true landing spot, seconds)]."""
-    field = Field([box1, box2], start, drift=drift, seed=seed, **kw)
+    field = Field([box1, box2], start, drift=drift, seed=seed, walls=walls, **kw)
     anchor, out = m.Anchor(*start), []
-    for x_target, remembered in ((goal[0], None), (start[0], start)):
+    for _, x_target, y_range, remembered in m.mission_legs(start, goal, sweep):
         field.take_off()
-        leg = m.Leg(x_target, sweep, box_size=box_size, remembered=remembered)
+        leg = m.Leg(x_target, y_range, box_size=box_size, remembered=remembered)
         t = fly_leg(field, leg, anchor)
         out.append((leg, (field.x, field.y), t))
         if not leg.done:
@@ -77,7 +77,7 @@ class SweepLineTests(unittest.TestCase):
 
 
 class MissionTests(unittest.TestCase):
-    def assert_lands_on_both(self, box1, box2, start, goal, tolerance=.06, seeds=range(2), **kw):
+    def assert_lands_on_both(self, box1, box2, start, goal, tolerance=.06, seeds=(0, 1), **kw):
         for seed in seeds:
             legs = mission(box1, box2, start, goal, seed=seed, **kw)
             self.assertEqual(len(legs), 2, f'seed {seed}: leg 1 failed: {legs[0][0].fault}')
@@ -96,6 +96,29 @@ class MissionTests(unittest.TestCase):
     def test_with_odometry_drift(self):
         self.assert_lands_on_both((0., 0., .4, .4, 0.), (2.1, .3, .4, .4, 0.), start=(0., 0.), goal=(2.0, 0.),
                                   drift=.005, chase=.55, bias=.015, tolerance=.08)
+
+    def test_sweep_is_centered_on_each_points_y(self):
+        legs = m.mission_legs((0., .2), (3.25, 1.14), (-.5, .5))
+        self.assertEqual(legs[0][1], 3.25)
+        self.assertAlmostEqual(legs[0][2][0], .64)
+        self.assertAlmostEqual(legs[0][2][1], 1.64)
+        self.assertAlmostEqual(legs[1][2][0], -.3)
+        self.assertAlmostEqual(legs[1][2][1], .7)
+
+    def test_box_far_from_y_zero(self):
+        # Like the last flights: goal y 1.14, so a sweep around y = 0 never reaches it.
+        self.assert_lands_on_both((0., 0., .4, .4, 0.), (3.3, 1.25, .4, .4, 0.), start=(0., 0.),
+                                  goal=(3.25, 1.14), sweep=(-.6, .6), seeds=[0])
+
+    def test_wall_cuts_a_sweep_line_short(self):
+        # Box on the second line; the first line runs into a wall at y = 0.75 before its
+        # range end (1.0). The second line must start where the first stopped.
+        wall = (1.0, 3.0, .75, .85)
+        legs = mission((0., 0., .4, .4, 0.), (2.18, -.3, .4, .4, 0.), start=(0., 0.), goal=(2.0, 0.),
+                       walls=[wall])
+        leg = legs[0][0]
+        self.assertTrue(leg.done, f'{leg.fault} {leg.notes}')
+        self.assertLess(math.dist(legs[0][1], (2.18, -.3)), .06)
 
     def test_return_uses_the_local_sweep(self):
         legs = mission((0., 0., .4, .4, 0.), (2.0, .5, .4, .4, 0.), start=(0., 0.), goal=(2.0, 0.))

@@ -2,13 +2,14 @@
 and land on the box at A.
 
     python3 mission.py --start 0 0 --goal 3.0 0.5 --sweep -1.0 1.0
-    python3 mission.py --box-size 0.40 --box-height 0.29 --x-window 0.3 --pause 5
+    python3 mission.py --box-size 0.45 --box-height 0.16 --x-window 0.3 --pause 5
 
 Coordinates are map meters; START (point A) is where the drone sits at takeoff, on top
 of box 1, nose along map +X. Each leg:
 
 1. NAV: fly to the first sweep line with the obstacle-avoiding navigator (planner.py).
-2. SWEEP: fly parallel lines along Y across the --sweep range, near the target x. The box
+2. SWEEP: fly parallel lines along Y across the --sweep range around the target's y
+   (e.g. -0.5 0.5 sweeps goal_y - 0.5 .. goal_y + 0.5), near the target x. The box
    center may be up to --x-window from it; the lines are close enough that one of them
    crosses the box well inside its edges. Each line is a box_finder search; on the first
    dip it finds the center (one pass each way along Y and X) and the leg ends.
@@ -32,7 +33,8 @@ from planner import Navigator, guard, wrap
 
 START = (0.0, 0.0)          # Point A: map position of box 1, where the drone takes off, m.
 GOAL = (3.25, 1.14)           # Point B: the box there is near this x, m.
-SWEEP = (-0.5, 0.5)         # Y range swept at each end, map m. Start/end it off the box.
+SWEEP = (-0.5, 0.5)         # Y range swept at each end, relative to that point's y, m.
+                            # Start/end it off the box.
 X_WINDOW = 0.30             # m; the box center is within this of the target x.
 LINE_MARGIN = 0.05          # m; a line must pass this far inside the box edge to see it well.
 LOCAL_UNCERTAINTY = 0.30    # m; how far box 1 may be from where we remember it.
@@ -42,6 +44,10 @@ HOP_SPEED = 0.20            # m/s
 HOP_SECONDS = 15.
 HEIGHT_TOLERANCE = 0.15     # While navigating, land if zrange is off HEIGHT by more than this
 HEIGHT_SECONDS = 1.5        # ...for this long. Box edges cause ~0.6 s spikes.
+UP_STOP = 0.20              # m; land if the up ranger reads less than this...
+UP_SECONDS = 0.15           # ...for this long (one bad reading isn't enough).
+ZRANGE_FROZEN = 1.0         # s; land if the down ranger repeats the same value this long.
+                            # Normal: <=0.3 s. One flight logged 0.501 m for 52 s.
 LEG_SECONDS = 300.
 DEFAULT_URI = 'radio://0/98/2M/E7E7E7E7E8'
 
@@ -109,7 +115,12 @@ class Leg:
             if abs(self.pos[1] - y_b) < abs(self.pos[1] - y_a):
                 y_a, y_b = y_b, y_a
             for k, x_line in enumerate(lines):
-                y0, y1 = (y_a, y_b) if k % 2 == 0 else (y_b, y_a)
+                y1 = y_b if k % 2 == 0 else y_a
+                # Later lines start where the previous one ended: a wall may have cut it
+                # short, and the range end behind that wall can't be reached.
+                y0 = y_a if k == 0 else min(max(self.pos[1], min(y_a, y_b)), max(y_a, y_b))
+                if abs(y1 - y0) < .1:
+                    continue
                 yield from self._travel((x_line, y0))
                 self.finder = BoxFinder(search_direction=(0., 1. if y1 > y0 else -1.),
                                         search_distance=abs(y1 - y0), box_height=self.box_height,
@@ -143,6 +154,13 @@ class Leg:
         except StopIteration:
             pass
         return 0., 0., 0.
+
+
+def mission_legs(start=START, goal=GOAL, sweep=SWEEP):
+    """[(name, x_target, y_range, remembered box)] for the two legs. `sweep` is relative to
+    the target's y."""
+    return [('to B', goal[0], (goal[1] + sweep[0], goal[1] + sweep[1]), None),
+            ('back to A', start[0], (start[1] + sweep[0], start[1] + sweep[1]), start)]
 
 
 class Anchor:
@@ -182,7 +200,7 @@ def fly(uri, output, start=START, goal=GOAL, sweep=SWEEP, window=X_WINDOW,
             d = latest['pose'][1]
         return d['stateEstimate.x'], d['stateEstimate.y'], d['stateEstimate.yaw']
 
-    legs = [('to B', goal[0], None), ('back to A', start[0], start)]
+    legs = mission_legs(start, goal, sweep)
     anchor, results = Anchor(*start), []
     cflib.crtp.init_drivers()
     with open(output, 'w', newline='') as file, \
@@ -209,41 +227,49 @@ def fly(uri, output, start=START, goal=GOAL, sweep=SWEEP, window=X_WINDOW,
                 if time.monotonic() > deadline:
                     raise RuntimeError('No telemetry')
                 time.sleep(.05)
-            for number, (name, x_target, remembered) in enumerate(legs, 1):
+            for number, (name, x_target, y_range, remembered) in enumerate(legs, 1):
                 if number > 1:
                     print(f'On the box; taking off again in {pause:.0f} s')
                     time.sleep(pause)
-                leg = Leg(x_target, sweep, box_size, box_height, window, remembered, arena)
+                leg = Leg(x_target, y_range, box_size, box_height, window, remembered, arena)
                 scf.cf.platform.send_arming_request(True)
                 time.sleep(1.)
                 print(f'Leg {number} ({name}): taking off at map ({anchor.x:.2f}, {anchor.y:.2f}); '
-                      f'sweep lines x = {", ".join(f"{x:.2f}" for x in sweep_lines(x_target, window, box_size))}')
+                      f'sweep lines x = {", ".join(f"{x:.2f}" for x in sweep_lines(x_target, window, box_size))}, '
+                      f'y {y_range[0]:.2f} .. {y_range[1]:.2f}')
                 motion.take_off()
                 motion.start_linear_motion(0., 0., 0., 0.)
                 time.sleep(1.)
                 result, t0 = None, time.monotonic()
-                height_ok = last_print = t0
+                height_ok = last_print = last_flush = t0
+                up_low_since, last_zrange, zrange_changed = None, None, t0
                 printed, printed_finder, printed_finder_notes = 0, None, 0
                 while result is None:
                     now = time.monotonic()
                     with lock:
                         (got_pose, d), (got_walls, w) = latest['pose'], latest['walls']
-                    if now - min(got_pose, got_walls) > .5:
-                        result = 'telemetry lost'; break
-                    if now - t0 > LEG_SECONDS:
-                        result = 'leg time limit'; break
                     up = bf.meters(w['range.up'])
-                    if up < .2:
-                        result = 'object above the drone'; break
                     zrange = bf.meters(d['range.zrange'])
-                    if not leg.state.startswith('NAV') or (math.isfinite(zrange) and abs(zrange - bf.HEIGHT) < HEIGHT_TOLERANCE):
-                        height_ok = now
-                    if now - height_ok > HEIGHT_SECONDS:
-                        result = f'height lost while navigating (z-range {zrange:.2f} m)'; break
                     ranges = tuple(bf.meters(w['range.'+beam]) for beam in WALL_BEAMS)
                     ox, oy, oyaw = d['stateEstimate.x'], d['stateEstimate.y'], d['stateEstimate.yaw']
                     x, y, yaw = anchor.pose(ox, oy, oyaw)
-                    command = leg.step(now - t0, x, y, yaw, zrange, ranges)
+                    # A single spurious up reading stopped two flights, so it must persist.
+                    up_low_since = (up_low_since or now) if up < UP_STOP else None
+                    if not leg.state.startswith('NAV') or (math.isfinite(zrange) and abs(zrange - bf.HEIGHT) < HEIGHT_TOLERANCE):
+                        height_ok = now
+                    if d['range.zrange'] != last_zrange:
+                        last_zrange, zrange_changed = d['range.zrange'], now
+                    if now - min(got_pose, got_walls) > .5:
+                        result = 'telemetry lost'
+                    elif now - zrange_changed > ZRANGE_FROZEN:
+                        result = f'down ranger frozen at {zrange:.3f} m'
+                    elif now - t0 > LEG_SECONDS:
+                        result = 'leg time limit'
+                    elif up_low_since is not None and now - up_low_since >= UP_SECONDS:
+                        result = f'object above the drone ({up:.2f} m)'
+                    elif now - height_ok > HEIGHT_SECONDS:
+                        result = f'height lost while navigating (z-range {zrange:.2f} m)'
+                    command = (0., 0., 0.) if result else leg.step(now - t0, x, y, yaw, zrange, ranges)
                     finder = leg.finder
                     c = leg.center or (math.nan, math.nan)
                     log.writerow({'time': now - t0, 'leg': number, 'state': leg.state,
@@ -254,6 +280,10 @@ def fly(uri, output, start=START, goal=GOAL, sweep=SWEEP, window=X_WINDOW,
                                   'deviation': finder.detector.deviation if finder else '',
                                   **dict(zip(('cmd_vx', 'cmd_vy', 'cmd_yaw_rate'), command)),
                                   'center_x': c[0], 'center_y': c[1]})
+                    if now - last_flush > .25:
+                        file.flush(); last_flush = now
+                    if result:
+                        break
                     if finder is not printed_finder:
                         printed_finder, printed_finder_notes = finder, 0
                     while finder and len(finder.notes) > printed_finder_notes:
@@ -299,8 +329,8 @@ if __name__ == '__main__':
                         help='point A, map m: box 1, where the drone takes off')
     parser.add_argument('--goal', nargs=2, type=float, metavar=('X', 'Y'), default=GOAL,
                         help='point B, map m: the second box is near this x')
-    parser.add_argument('--sweep', nargs=2, type=float, metavar=('Y_MIN', 'Y_MAX'), default=SWEEP,
-                        help='map Y range swept at both ends')
+    parser.add_argument('--sweep', nargs=2, type=float, metavar=('DY_MIN', 'DY_MAX'), default=SWEEP,
+                        help="Y range swept at each end, relative to that point's y")
     parser.add_argument('--x-window', type=float, default=X_WINDOW,
                         help='m; box center is within this of the target x')
     parser.add_argument('--box-size', type=float, default=bf.BOX_SIZE, help='side of the square box, m')
@@ -309,9 +339,22 @@ if __name__ == '__main__':
     parser.add_argument('--arena', nargs=4, type=float, metavar=('X_MIN', 'X_MAX', 'Y_MIN', 'Y_MAX'),
                         help='virtual fence for the navigator, map m (default: none)')
     parser.add_argument('--output', default=datetime.now().strftime('mission_log_%Y%m%d_%H%M%S.csv'))
+    parser.add_argument('--no-live', action='store_true', help='no live plot window')
     args = parser.parse_args()
-    outcome = fly(args.uri, args.output, tuple(args.start), tuple(args.goal), tuple(args.sweep),
-                  args.x_window, args.box_size, args.box_height, args.pause,
-                  tuple(args.arena) if args.arena else None)
+    import mission_plot
+    meta = {'start': tuple(args.start), 'goal': tuple(args.goal), 'sweep': tuple(args.sweep),
+            'window': args.x_window, 'box_size': args.box_size}
+    viewer = None if args.no_live else mission_plot.start_live(args.output, meta)
+    outcome = []
+    try:
+        outcome = fly(args.uri, args.output, tuple(args.start), tuple(args.goal), tuple(args.sweep),
+                      args.x_window, args.box_size, args.box_height, args.pause,
+                      tuple(args.arena) if args.arena else None)
+    finally:
+        from pathlib import Path
+        if Path(args.output).exists():
+            print('Plot:', mission_plot.save(args.output, meta))
     print('Result:', ' | '.join(outcome), '| log:', args.output)
+    if viewer is not None and viewer.is_alive():
+        print('Close the live plot window to exit.')
     raise SystemExit(0 if len(outcome) == 2 and all(r.startswith('landed') for r in outcome) else 1)

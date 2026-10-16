@@ -1,5 +1,8 @@
 # Crazyflie: fly from A to B around obstacles
 
+For the two-box mission (fly to a box, land on it, come back and land on the first one),
+see [MISSION.md](MISSION.md).
+
 Hardware: Crazyflie 2.x with Flow deck and Multi-ranger deck.
 
 ```bash
