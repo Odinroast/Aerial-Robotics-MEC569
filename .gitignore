@@ -3,3 +3,4 @@ cache/
 venv/
 flight*
 box_log*
+mission_log*

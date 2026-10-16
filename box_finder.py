@@ -46,8 +46,8 @@ import numpy as np
 from planner import guard   # Body-frame range guard shared with the navigation stack.
 
 HEIGHT = 0.5              # Flight height above the surface underneath, m.
-BOX_HEIGHT = 0.29         # m; thresholds scale with it.
-BOX_SIZE = 0.40           # m; largest side of the box (or a bit more). Sets the pass length.
+BOX_HEIGHT = 0.16         # m; thresholds scale with it.
+BOX_SIZE = 0.45           # m; largest side of the box (or a bit more). Sets the pass length.
 # Thresholds as fractions of the box height, from the push log with a 26 cm box: hover
 # zrange 0.515 +/- 0.010 m (max 0.534); edge dips to 0.19-0.38; on top of the box the
 # controller only half recovers (0.38-0.41); spikes off the box reach 0.57-0.94.
