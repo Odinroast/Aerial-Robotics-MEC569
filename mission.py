@@ -32,10 +32,10 @@ from box_finder import BoxFinder, Failed
 from planner import Navigator, guard, wrap
 
 START = (0.0, 0.0)          # Point A: map position of box 1, where the drone takes off, m.
-GOAL = (3.25, 1.14)           # Point B: the box there is near this x, m.
-SWEEP = (-0.5, 0.5)         # Y range swept at each end, relative to that point's y, m.
+GOAL = (1.35, 0.0)           # Point B: the box there is near this x, m.
+SWEEP = (-0.2, 0.2)         # Y range swept at each end, relative to that point's y, m.
                             # Start/end it off the box.
-X_WINDOW = 0.30             # m; the box center is within this of the target x.
+X_WINDOW = 0.10             # m; the box center is within this of the target x.
 LINE_MARGIN = 0.05          # m; a line must pass this far inside the box edge to see it well.
 LOCAL_UNCERTAINTY = 0.30    # m; how far box 1 may be from where we remember it.
 PAUSE = 5.                  # s on box 2 before taking off again.
