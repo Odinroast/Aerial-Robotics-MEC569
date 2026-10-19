@@ -204,3 +204,20 @@ venv/bin/python mission_plot.py mission_log_<time>.csv --live   # follow a log b
   turns ±45° to scan; the box finding doesn't turn).
 - Box 2 must actually be within `--x-window` of B's x and inside the sweep range; the
   drone doesn't look anywhere else.
+
+## Known issues
+
+Both are from mission 20261018_175000 (B at (1.35, 0), wall at x ≈ 1.8) and are not
+fixed yet:
+
+- **Approach goal inside a wall.** The approach aims 0.55 m past the target. If that point
+  is in or next to a wall, the navigator has no path and reports `NO_PATH`. It still
+  flies toward the goal, but the box watch only runs in `DIRECT`, `DETOUR` and `BLOCKED`,
+  so it crossed the box without looking. After 10 s it gave up and the sweep found the
+  box (55 s for the leg). The planned fix: watch in `NO_PATH` too, and pull the goal back
+  to the target when obstacles show up near it.
+- **Radio link lost between legs.** "Too many packets lost" while sitting on box 2 left
+  the Crazyflie disconnected, and leg 2's `take_off()` raised "Crazyflie is not
+  connected". The log and plot were still saved. The planned fix: check the link before
+  each takeoff and reconnect (the drone is on the ground then), or stop with a clear
+  message.
