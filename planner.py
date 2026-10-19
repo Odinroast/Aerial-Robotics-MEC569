@@ -152,9 +152,13 @@ def guard(vx, vy, ranges):
 
 
 class Navigator:
-    def __init__(self, goal, arena=None):
-        """goal: (x, y) in meters. arena: optional (x_min, x_max, y_min, y_max) virtual fence."""
+    def __init__(self, goal, arena=None, scan_every=SCAN_EVERY, startup_scan=True, max_speed=MAX_SPEED):
+        """goal: (x, y) in meters. arena: optional (x_min, x_max, y_min, y_max) virtual fence.
+        scan_every: rescan after flying this far (math.inf: only when blocked).
+        startup_scan: scan before moving; skip it when the obstacle memory is already filled.
+        max_speed: m/s; may be changed between steps."""
         self.goal = (float(goal[0]), float(goal[1]))
+        self.scan_every, self.max_speed = scan_every, max_speed
         self.arena = self.bounds = arena
         self.points = {}               # cell -> (x, y, time)
         self.last_ranges = (math.nan,)*4
@@ -162,7 +166,7 @@ class Navigator:
         self.heading = None            # Chosen travel heading, radians.
         self.path, self.planned_at = None, -math.inf
         self.no_path_since = self.stuck_since = self.arrived_since = None
-        self.state, self.reason, self.fault = 'BRAKE', 'startup', None
+        self.state, self.reason, self.fault = ('BRAKE' if startup_scan else 'MOVE'), 'startup', None
         self.phase_start, self.scan_targets, self.scan_xy = None, [], None
         self.done = False
         self.free = float('nan')
@@ -349,6 +353,7 @@ class Navigator:
         deviation = np.abs(np.angle(np.exp(1j*(candidates - desired))))
         deviation[~valid] = np.inf
         best = int(np.argmin(deviation))
+        self.scan_xy = self.scan_xy or (x, y)
         travelled = math.dist((x, y), self.scan_xy)
 
         if not math.isfinite(deviation[best]):
@@ -362,15 +367,15 @@ class Navigator:
                 return 0., 0., 0.
             return self._output(0., 0., yaw_rate, ranges)
         self.stuck_since = None
-        if travelled >= SCAN_EVERY or (best and travelled > .2):
-            self._brake(now, 'periodic scan' if travelled >= SCAN_EVERY else 'planned direction blocked')
+        if travelled >= self.scan_every or (best and travelled > .2):
+            self._brake(now, 'periodic scan' if travelled >= self.scan_every else 'planned direction blocked')
             return self._output(0., 0., 0., ranges)
         self.heading, self.free = float(candidates[best]), float(free[best])
         self.state = ('BLOCKED' if best else 'DIRECT' if direct else
                       'DETOUR' if self.path else 'NO_PATH')
         self.reason = f'heading {math.degrees(self.heading):.0f} deg, {self.free:.2f} m free'
 
-        speed = min(MAX_SPEED, .5*(self.free - .05), .8*distance + .02)
+        speed = min(self.max_speed, .5*(self.free - .05), .8*distance + .02)
         wx, wy = speed*math.cos(self.heading), speed*math.sin(self.heading)
         c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
         return self._output(c*wx + s*wy, -s*wx + c*wy, yaw_rate, ranges)

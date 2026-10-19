@@ -58,8 +58,11 @@ def sweep_areas(meta):
     start, goal = meta.get('start') or mission.START, meta['goal']
     sweep, window = meta.get('sweep') or mission.SWEEP, meta.get('window') or mission.X_WINDOW
     box = meta.get('box_size') or mission.bf.BOX_SIZE
-    return [(str(k), mission.sweep_lines(x, window, box), y_range, window, x)
-            for k, (_, x, y_range, _) in enumerate(mission.mission_legs(start, goal, sweep), 1)]
+    areas = []
+    for k, (_, x, y_range, remembered) in enumerate(mission.mission_legs(start, goal, sweep), 1):
+        for _, px, centers, w in mission.Leg(x, y_range, box, window=window, remembered=remembered).plans:
+            areas.append((str(k), mission.sweep_lines(px, w, box), mission.line_extent(centers, box), w, px))
+    return areas
 
 
 def draw(fig, track, meta=None, title=None, live=False):
@@ -90,7 +93,8 @@ def draw(fig, track, meta=None, title=None, live=False):
                    if math.isfinite(number(r, 'center_x'))]
         if centers:
             ax.plot(*centers[-1], '+', color='tab:green', ms=14, mew=2.5)
-    enters = [r for r in rows if r.get('event') == 'enter' and r['state'].startswith('BOX')]
+    enters = [r for r in rows if r.get('event') == 'enter'
+              and (r['state'].startswith('BOX') or r['state'].endswith('WATCH'))]
     if enters:
         ax.plot([number(r, 'x') for r in enters], [number(r, 'y') for r in enters], 'x', color='tab:red',
                 ms=8, mew=2, label='box edge seen')

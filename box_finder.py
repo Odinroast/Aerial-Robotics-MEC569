@@ -66,14 +66,20 @@ SMOOTH = 0.10             # s; average fresh zrange readings over this window.
 # The hover right after takeoff read ~2 cm higher than the same floor in steady flight
 # (0.52 vs 0.50 m), which alone crossed a 2 cm level. So the search measures the floor
 # level while flying, and can't report an enter until that level is known.
-FLOOR_SETTLE = 0.9        # s of search before an enter can count.
-FLOOR_WINDOW = (1.5, 0.4) # floor level = median of search readings from this many s ago to this many.
+FLOOR_SETTLE = 0.9        # s of search before an enter can count...
+BLIND_EXTRA = 0.025       # ...unless the dip is this much deeper than the enter level (vs. the hover):
+                          # mission 111021 started a line at the box edge and dipped 6.6 cm at 0.65 s.
+FLOOR_WINDOW = (1.5, 0.4) # floor level = median of search readings from this many s ago to this many,
+FLOOR_IGNORE = 0.4        # skipping the first this many s: still accelerating, still hover-biased.
 SEARCH_DISTANCE = 2.0     # m to fly looking for the box before giving up.
-PASS_SPEED = 0.15         # m/s; search and passes, the same both ways.
+PASS_SPEED = 0.20         # m/s; search and passes, the same both ways. Faster dips deeper.
+GOTO_SPEED = 0.25         # m/s; moves between passes (no measuring).
 PAST_EDGE = 0.20          # m to fly past a box edge: real profiles settle ~0.4 m after it
                           # (13 cm lag, then the height controller's overshoot).
-CALIBRATE = 1.5           # s of hover to measure the floor zrange after takeoff.
-SETTLE = 1.0              # s to hold still so speed and height settle between passes.
+CALIBRATE = 1.0           # s of hover to measure the floor zrange before a search. Only the
+                          # first ~1 s of the search uses it; after that the floor is measured in flight.
+SETTLE = 0.6              # s to hold still so speed and height settle between passes (lag ~0.35 s).
+APPROACH_LAG = 0.10       # m an 'enter' lags the near edge at pass speed (backing up past it).
 WALL_STOP = 0.35          # m; end a search, pass or go-to when the ranger ahead reads less.
 SENSOR_ANGLES = (0., 180., 90., -90.)   # front, back, left, right (body frame, degrees)
 GAIN = 1.2                # 1/s, position hold / go-to gain.
@@ -127,6 +133,48 @@ class EdgeDetector:
         return None
 
 
+class SearchDetector:
+    """What a search uses on top of an EdgeDetector: the floor level measured in flight.
+
+    The hover right after takeoff read ~2 cm higher than the same floor in steady flight,
+    so until the in-flight level is known (FLOOR_SETTLE) only a dip BLIND_EXTRA deeper than
+    the enter level counts (blind_extra=None: none counts). Call check() once per control
+    step, after the detector's update(), while flying steadily; restart() after stopping."""
+
+    def __init__(self, detector, blind_extra=BLIND_EXTRA):
+        self.detector, self.blind_extra = detector, blind_extra
+        self.restart()
+
+    def restart(self):
+        self.began, self.floor, self.tracking, self.last, self.blind = None, [], False, None, True
+        self.detector.on_box, self.detector.below_since = False, None
+
+    def check(self, now, zrange, event):
+        """True when the box counts as found."""
+        d = self.detector
+        if self.began is None:
+            self.began = now
+        older = [z for t, z in self.floor if now - FLOOR_WINDOW[0] <= t < now - FLOOR_WINDOW[1]]
+        found = False
+        self.blind = now - self.began < FLOOR_SETTLE or len(older) < 5
+        if self.blind:
+            found = (self.blind_extra is not None and event == 'enter'
+                     and d.deviation < -(d.enter_level + self.blind_extra))
+            if not found:
+                d.on_box = False
+        elif self.tracking and event == 'enter':
+            found = True
+        else:
+            d.height = sorted(older)[len(older)//2]
+            if not self.tracking:
+                # Time spent below the hover level doesn't count against the floor level.
+                self.tracking, d.below_since, d.on_box = True, None, False
+        if zrange != self.last and math.isfinite(zrange) and now - self.began >= FLOOR_IGNORE:
+            self.floor.append((now, zrange))
+        self.last = zrange
+        return found
+
+
 def mirror_center(out, back, guess, span, min_signal=SIGNAL_FRACTION*BOX_HEIGHT):
     """Box center along a line from two zrange profiles [(position, zrange), ...] recorded
     flying out (+) and back (-) along it: the point c where back(2c - s) best matches out(s),
@@ -158,7 +206,18 @@ class BoxFinder:
     """Pure logic: feed step() the pose and zrange, get body velocities back."""
 
     def __init__(self, search_direction=(1., 0.), search_distance=SEARCH_DISTANCE,
-                 box_height=BOX_HEIGHT, box_size=BOX_SIZE, height=HEIGHT):
+                 box_height=BOX_HEIGHT, box_size=BOX_SIZE, height=HEIGHT, cross_offset=None,
+                 approach=None, approach_profile=None):
+        """cross_offset: how far the box center may be from the search line (default: half
+        a box, i.e. the line only has to touch the box). Sets the cross pass length.
+        approach: map point where the box was already detected while flying along
+        search_direction (navigation). Skips the search: backs up before the near edge and
+        flies one out-and-back pass through that point instead. `height`: floor zrange.
+        approach_profile: [(x, y, zrange), ...] flown straight along search_direction up to
+        the approach point; it becomes the start of the out pass, so there is no back-up."""
+        self.cross_offset = box_size/2 if cross_offset is None else cross_offset
+        self.approach, self.approach_profile = approach, approach_profile
+        self.first_enter = None
         n = math.hypot(*search_direction)
         ux, uy = search_direction[0]/n, search_direction[1]/n
         self.frame = ((ux, uy), (-uy, ux))      # search axis, perpendicular axis
@@ -188,7 +247,7 @@ class BoxFinder:
                 self.notes.append(f'go-to stopped {math.dist(self.pos, point):.2f} m short: wall')
                 point = self.pos
                 break
-            yield self._toward(point, PASS_SPEED)
+            yield self._toward(point, GOTO_SPEED)
         yield from self._hold(point, SETTLE)
 
     def _line(self, u, line, speed):
@@ -202,18 +261,16 @@ class BoxFinder:
         and fail if there is none within the search distance."""
         self.state, start, last = ('SEARCH' if search else 'PASS'), self.pos, None
         profile = [] if profile is None else profile
-        began, floor = self.now, []
+        watch = SearchDetector(self.detector)
+        self.first_enter = None
         while search or (self.pos[0]*u[0] + self.pos[1]*u[1]) < stop:
             if search:
-                older = [z for t, z in floor if self.now - FLOOR_WINDOW[0] <= t < self.now - FLOOR_WINDOW[1]]
-                if self.now - began < FLOOR_SETTLE or len(older) < 5:
-                    self.detector.on_box = False
-                elif self.event == 'enter':
+                if watch.check(self.now, self.zrange, self.event):
                     break
-                else:
-                    self.detector.height = sorted(older)[len(older)//2]
-                if self.zrange != last and math.isfinite(self.zrange):
-                    floor.append((self.now, self.zrange))
+                if watch.blind:
+                    self.event = None
+            elif self.event == 'enter' and self.first_enter is None:
+                self.first_enter = self.pos[0]*u[0] + self.pos[1]*u[1]
             if search and math.dist(self.pos, start) > self.search_distance:
                 raise Failed(f'no box found within {self.search_distance:.1f} m')
             if self._ahead(u) < WALL_STOP:
@@ -244,7 +301,37 @@ class BoxFinder:
         self.history.append((u, guess, found))
         return found
 
+    def _approach_pass(self, u):
+        """Along u through the approach point: start before the near edge, out past the box
+        and back. Returns the center along u."""
+        along = lambda p: p[0]*u[0] + p[1]*u[1]
+        detected = along(self.approach)
+        self.center = self.approach
+        if self.approach_profile is not None:
+            # Like a search: keep going at the same speed, then back past the near edge.
+            out = [(along(p), z) for *p, z in self.approach_profile]
+            line = self.pos
+            out = yield from self._pass(u, line, detected + self.box_size + PAST_EDGE, out)
+            lo, hi = detected + .02, detected + .75*self.box_size
+            return (yield from self._back(u, line, detected - PAST_EDGE, out,
+                                          guess=(lo + hi)/2, span=(hi - lo)/2))
+        back_off = APPROACH_LAG + PAST_EDGE + .10       # + room to reach pass speed
+        start = (self.approach[0] - back_off*u[0], self.approach[1] - back_off*u[1])
+        yield from self._goto(start)
+        self.detector.on_box = False
+        out = yield from self._pass(u, start, detected + self.box_size + PAST_EDGE)
+        # The edge this pass saw, if any; it lags the near edge like a search's enter.
+        hit = self.first_enter if self.first_enter is not None else detected
+        lo, hi = hit + .02, hit + .75*self.box_size
+        return (yield from self._back(u, start, along(start), out, guess=(lo + hi)/2, span=(hi - lo)/2))
+
     def _mission(self):
+        if self.approach is not None:
+            (u, v) = self.frame
+            cu = yield from self._approach_pass(u)
+            cv = self.approach[0]*v[0] + self.approach[1]*v[1]
+            yield from self._cross(cu, cv)
+            return
         # Hover over the floor first and use the measured zrange as the reference level.
         self.state, until, readings = 'SETTLE', self.now + CALIBRATE, []
         while self.now < until:
@@ -271,15 +358,17 @@ class BoxFinder:
         lo, hi = hit + .02, hit + .75*self.box_size
         cu = yield from self._back(u, start, hit - PAST_EDGE, out,
                                    guess=(lo + hi)/2, span=(hi - lo)/2)
-        cv = along(start, v)
-        self.center = (cu*u[0] + cv*v[0], cu*u[1] + cv*v[1])
+        yield from self._cross(cu, along(start, v))
 
-        # Y: across the box through the x center, from one side to the other and back.
-        half = self.box_size + PAST_EDGE
+    def _cross(self, cu, cv):
+        """Across the box (along v) through center cu on u, out and back; then land there."""
+        u, v = self.frame
+        self.center = (cu*u[0] + cv*v[0], cu*u[1] + cv*v[1])
+        half = self.cross_offset + self.box_size/2 + PAST_EDGE
         yield from self._goto((self.center[0] - half*v[0], self.center[1] - half*v[1]))
         out = yield from self._pass(v, self.center, cv + half)
         cv = yield from self._back(v, self.center, cv - half, out,
-                                   guess=cv, span=self.box_size/2 + .15)
+                                   guess=cv, span=self.cross_offset + .15)
         self.center = (cu*u[0] + cv*v[0], cu*u[1] + cv*v[1])
         yield from self._goto(self.center)
         self.state, self.done = 'LAND', True
